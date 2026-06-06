@@ -1,10 +1,359 @@
 ﻿#DISABLE DEFENDER SCRIPT BY ZOIC
 
+# ════════════════════════════════════════════════════════════════════════════
+# LOGGING INFRASTRUCTURE
+# ════════════════════════════════════════════════════════════════════════════
+$script:LogFile    = "$env:TEMP\DisableDefender_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+$script:StageTimer = $null
+$script:StageNum   = 0
+$script:Errors     = [System.Collections.Generic.List[string]]::new()
+$script:Warnings   = [System.Collections.Generic.List[string]]::new()
+
+# Core logger — writes timestamped, levelled lines to the txt file AND console
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet('INFO','WARN','ERROR','SUCCESS','STEP','DATA','HEADER','SEP')]
+        [string]$Level = 'INFO'
+    )
+    $ts    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+    $entry = switch ($Level) {
+        'HEADER' { "`n$('=' * 90)`n  $Message`n$('=' * 90)" }
+        'SEP'    { "$('-' * 90)" }
+        default  { "[$ts] [$($Level.PadRight(7))] $Message" }
+    }
+    Add-Content -Path $script:LogFile -Value $entry -Encoding UTF8
+    if ($Level -eq 'ERROR')   { $script:Errors.Add("[$ts] $Message") }
+    if ($Level -eq 'WARN')    { $script:Warnings.Add("[$ts] $Message") }
+    switch ($Level) {
+        'ERROR'  { Write-Host $entry -ForegroundColor Red }
+        'WARN'   { Write-Host $entry -ForegroundColor Yellow }
+        'SUCCESS'{ Write-Host $entry -ForegroundColor Green }
+        'STEP'   { Write-Host $entry -ForegroundColor Cyan }
+        'HEADER' { Write-Host $entry -ForegroundColor Magenta }
+        'DATA'   { Write-Host $entry -ForegroundColor Gray }
+        default  { Write-Host $entry }
+    }
+}
+
+# Writes a blank line as visual separator
+function Write-LogBlank { Add-Content -Path $script:LogFile -Value '' -Encoding UTF8 }
+
+# Begins a named stage — prints header and starts a stopwatch
+function Start-Stage {
+    param([string]$Name)
+    $script:StageNum++
+    $script:StageTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-LogBlank
+    Write-Log "STAGE $($script:StageNum): $Name" 'HEADER'
+}
+
+# Ends the current stage — prints elapsed time
+function End-Stage {
+    param([string]$Name = '')
+    $script:StageTimer.Stop()
+    $elapsed = $script:StageTimer.Elapsed.ToString('mm\:ss\.fff')
+    Write-Log "Stage completed in $elapsed" 'SUCCESS'
+    Write-Log '' 'SEP'
+}
+
+# Runs a block, captures all output+errors, logs everything with timing
+function Invoke-Logged {
+    param([string]$Label, [scriptblock]$Block)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Log "  --> $Label" 'STEP'
+    try {
+        $out = & $Block 2>&1
+        $sw.Stop()
+        if ($out) {
+            foreach ($line in ($out | Out-String).Split("`n")) {
+                $l = $line.TrimEnd()
+                if ($l) { Write-Log "      $l" 'DATA' }
+            }
+        }
+        Write-Log "  <-- $Label | exit=$LASTEXITCODE | elapsed=$($sw.Elapsed.ToString('ss\.fff'))s" 'SUCCESS'
+    } catch {
+        $sw.Stop()
+        Write-Log "  <-- $Label | EXCEPTION after $($sw.Elapsed.ToString('ss\.fff'))s: $($_.Exception.Message)" 'ERROR'
+        Write-Log "      ScriptStackTrace: $($_.ScriptStackTrace)" 'ERROR'
+    }
+}
+
+# Dumps every property of an object as key=value lines
+function Write-LogObject {
+    param([string]$Label, $Obj)
+    Write-Log "  [$Label]" 'STEP'
+    if ($null -eq $Obj) { Write-Log "      (null)" 'WARN'; return }
+    $Obj | Get-Member -MemberType Properties | ForEach-Object {
+        $name = $_.Name
+        try { $val = $Obj.$name } catch { $val = "(access error: $_)" }
+        Write-Log "      $($name.PadRight(40)) = $val" 'DATA'
+    }
+}
+
+# Snapshots all Defender-related services with full detail
+function Write-ServiceSnapshot {
+    param([string]$Label)
+    Write-Log "  -- Service Snapshot: $Label --" 'STEP'
+    $svcNames = @(
+        'WinDefend','WdNisSvc','WdNisDrv','WdFilter','WdBoot',
+        'wscsvc','SecurityHealthService','Sense','MpDefenderCoreService',
+        'SgrmAgent','SgrmBroker','webthreatdefusersvc','webthreatdefsvc',
+        'MsSecCore','MsSecFlt','MsSecWfp','MsMpEng'
+    )
+    foreach ($name in $svcNames) {
+        try {
+            $svc = Get-Service -Name $name -ErrorAction Stop
+            $wmi = Get-WmiObject Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
+            $pid_ = if ($wmi) { $wmi.ProcessId } else { 'N/A' }
+            $path = if ($wmi) { $wmi.PathName } else { 'N/A' }
+            $start= if ($wmi) { $wmi.StartMode } else { 'N/A' }
+            $acct = if ($wmi) { $wmi.StartName } else { 'N/A' }
+            Write-Log ("      {0,-35} Status={1,-10} StartType={2,-12} PID={3,-8} Account={4}" -f `
+                $name, $svc.Status, $start, $pid_, $acct) 'DATA'
+            Write-Log ("      {0,-35} BinPath={1}" -f '', $path) 'DATA'
+        } catch {
+            Write-Log "      $($name.PadRight(35)) NOT FOUND / NOT INSTALLED" 'WARN'
+        }
+    }
+}
+
+# Snapshots all Defender-related running processes with full detail
+function Write-ProcessSnapshot {
+    param([string]$Label)
+    Write-Log "  -- Process Snapshot: $Label --" 'STEP'
+    $procNames = @(
+        'MsMpEng','MpCmdRun','OFFmeansOFF','NisSrv','MpDefenderCoreService',
+        'smartscreen','SecurityHealthService','SecurityHealthSystray',
+        'SgrmBroker','TrustedInstaller','wscsvc'
+    )
+    foreach ($name in $procNames) {
+        $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+        if ($procs) {
+            foreach ($p in $procs) {
+                Write-Log ("      {0,-35} PID={1,-7} CPU={2,-10} WS={3,-12} Path={4}" -f `
+                    $name, $p.Id, "$([math]::Round($p.TotalProcessorTime.TotalSeconds,2))s", `
+                    "$([math]::Round($p.WorkingSet64/1MB,1))MB", $p.Path) 'DATA'
+            }
+        } else {
+            Write-Log "      $($name.PadRight(35)) (not running)" 'DATA'
+        }
+    }
+}
+
+# Reads a registry value and logs it; returns current value or $null
+function Read-RegValue {
+    param([string]$Path, [string]$Name)
+    try {
+        $val = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop | Select-Object -ExpandProperty $Name
+        Write-Log "      REG  $Path\$Name = $val" 'DATA'
+        return $val
+    } catch {
+        Write-Log "      REG  $Path\$Name = (not found)" 'DATA'
+        return $null
+    }
+}
+
+# Dumps a full registry key (all values)
+function Dump-RegKey {
+    param([string]$Path)
+    try {
+        $props = Get-ItemProperty -Path $Path -ErrorAction Stop
+        $props.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } | ForEach-Object {
+            Write-Log "      $($_.Name.PadRight(50)) = $($_.Value)" 'DATA'
+        }
+    } catch {
+        Write-Log "      (key not readable or does not exist: $Path)" 'WARN'
+    }
+}
+
+# Collects recent Windows Defender event log entries
+function Write-DefenderEvents {
+    param([int]$MaxEvents = 30)
+    Write-Log "  -- Windows Defender Event Log (last $MaxEvents entries) --" 'STEP'
+    try {
+        $events = Get-WinEvent -LogName 'Microsoft-Windows-Windows Defender/Operational' `
+            -MaxEvents $MaxEvents -ErrorAction Stop
+        foreach ($ev in $events) {
+            Write-Log ("      [{0}] ID={1,-6} Level={2,-10} {3}" -f `
+                $ev.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $ev.Id, $ev.LevelDisplayName, `
+                ($ev.Message -replace "`r`n",' ' -replace "`n",' ').Substring(0,[math]::Min(120,$ev.Message.Length))) 'DATA'
+        }
+    } catch {
+        Write-Log "      Could not read Defender event log: $_" 'WARN'
+    }
+}
+
+# Dumps Tamper Protection and key Defender registry state
+function Write-DefenderRegistryState {
+    param([string]$Label)
+    Write-Log "  -- Defender Registry State: $Label --" 'STEP'
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender',
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender',
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection',
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection',
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender\Features',
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender\Spynet',
+        'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend'
+    )
+    foreach ($key in $keys) {
+        Write-Log "    Key: $key" 'STEP'
+        Dump-RegKey $key
+    }
+}
+
+# Writes system environment info block
+function Write-SystemInfo {
+    Write-Log "  -- System Information --" 'STEP'
+    $os  = Get-WmiObject Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $cpu = Get-WmiObject Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    $cs  = Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $bi  = Get-WmiObject Win32_BIOS -ErrorAction SilentlyContinue
+    $id  = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+    Write-Log "      ComputerName          = $env:COMPUTERNAME" 'DATA'
+    Write-Log "      UserName              = $env:USERNAME" 'DATA'
+    Write-Log "      WindowsIdentity       = $($id.Name)" 'DATA'
+    Write-Log "      Identity Groups       = $($id.Groups.Translate([Security.Principal.NTAccount]) -join ', ')" 'DATA'
+    Write-Log "      OS Caption            = $($os.Caption)" 'DATA'
+    Write-Log "      OS Version            = $($os.Version)" 'DATA'
+    Write-Log "      OS BuildNumber        = $($os.BuildNumber)" 'DATA'
+    Write-Log "      OS Architecture       = $($os.OSArchitecture)" 'DATA'
+    Write-Log "      OS InstallDate        = $($os.ConvertToDateTime($os.InstallDate))" 'DATA'
+    Write-Log "      OS LastBootUpTime     = $($os.ConvertToDateTime($os.LastBootUpTime))" 'DATA'
+    Write-Log "      OS FreePhysicalMem    = $([math]::Round($os.FreePhysicalMemory/1MB,2)) GB" 'DATA'
+    Write-Log "      OS TotalVisibleMem    = $([math]::Round($os.TotalVisibleMemorySize/1MB,2)) GB" 'DATA'
+    Write-Log "      CPU Name              = $($cpu.Name)" 'DATA'
+    Write-Log "      CPU Cores             = $($cpu.NumberOfCores)" 'DATA'
+    Write-Log "      CPU Logical           = $($cpu.NumberOfLogicalProcessors)" 'DATA'
+    Write-Log "      Manufacturer          = $($cs.Manufacturer)" 'DATA'
+    Write-Log "      Model                 = $($cs.Model)" 'DATA'
+    Write-Log "      BIOS Version          = $($bi.SMBIOSBIOSVersion)" 'DATA'
+    Write-Log "      BIOS ReleaseDate      = $($bi.ReleaseDate)" 'DATA'
+    Write-Log "      PowerShell Version    = $($PSVersionTable.PSVersion)" 'DATA'
+    Write-Log "      PowerShell Edition    = $($PSVersionTable.PSEdition)" 'DATA'
+    Write-Log "      CLR Version           = $($PSVersionTable.CLRVersion)" 'DATA'
+    Write-Log "      ExecutionPolicy       = $(Get-ExecutionPolicy)" 'DATA'
+    Write-Log "      PSCommandPath         = $PSCommandPath" 'DATA'
+    Write-Log "      TEMP directory        = $env:TEMP" 'DATA'
+    Write-Log "      SystemDrive           = $env:SystemDrive" 'DATA'
+    Write-Log "      ProgramFiles          = $env:ProgramFiles" 'DATA'
+    Write-Log "      ProgramData           = $env:ProgramData" 'DATA'
+    Write-Log "      Uptime                = $((Get-Date) - $os.ConvertToDateTime($os.LastBootUpTime))" 'DATA'
+
+    # Windows Defender product version
+    $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
+    if ($mpStatus) {
+        Write-Log "      AMProductVersion      = $($mpStatus.AMProductVersion)" 'DATA'
+        Write-Log "      AMEngineVersion       = $($mpStatus.AMEngineVersion)" 'DATA'
+        Write-Log "      AntispywareEnabled    = $($mpStatus.AntispywareEnabled)" 'DATA'
+        Write-Log "      AntivirusEnabled      = $($mpStatus.AntivirusEnabled)" 'DATA'
+        Write-Log "      RealTimeProtection    = $($mpStatus.RealTimeProtectionEnabled)" 'DATA'
+        Write-Log "      TamperProtection      = $($mpStatus.IsTamperProtected)" 'DATA'
+        Write-Log "      BehaviorMonitor       = $($mpStatus.BehaviorMonitorEnabled)" 'DATA'
+        Write-Log "      IoavProtection        = $($mpStatus.IoavProtectionEnabled)" 'DATA'
+        Write-Log "      NetworkInspection     = $($mpStatus.NISEnabled)" 'DATA'
+        Write-Log "      OnAccessProtection    = $($mpStatus.OnAccessProtectionEnabled)" 'DATA'
+        Write-Log "      AMRunningMode         = $($mpStatus.AMRunningMode)" 'DATA'
+        Write-Log "      AMServiceEnabled      = $($mpStatus.AMServiceEnabled)" 'DATA'
+        Write-Log "      AMServiceVersion      = $($mpStatus.AMServiceVersion)" 'DATA'
+        Write-Log "      QuickScanAge(days)    = $($mpStatus.QuickScanAge)" 'DATA'
+        Write-Log "      FullScanAge(days)     = $($mpStatus.FullScanAge)" 'DATA'
+        Write-Log "      SignatureAge(days)    = $($mpStatus.AntivirusSignatureAge)" 'DATA'
+        Write-Log "      SignatureLastUpdated  = $($mpStatus.AntivirusSignatureLastUpdated)" 'DATA'
+        Write-Log "      SignatureVersion      = $($mpStatus.AntivirusSignatureVersion)" 'DATA'
+    } else {
+        Write-Log "      Get-MpComputerStatus  = UNAVAILABLE (Defender may already be disabled or cmdlet missing)" 'WARN'
+    }
+}
+
+# Dump Defender scheduled tasks with full detail
+function Write-DefenderTasks {
+    param([string]$Label)
+    Write-Log "  -- Scheduled Tasks: $Label --" 'STEP'
+    $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'Windows Defender*' }
+    Write-Log "      Total Defender tasks found: $($tasks.Count)" 'DATA'
+    foreach ($t in $tasks) {
+        Write-Log "      Task: '$($t.TaskName)'" 'DATA'
+        Write-Log "            Path    : $($t.TaskPath)" 'DATA'
+        Write-Log "            State   : $($t.State)" 'DATA'
+        Write-Log "            URI     : $($t.URI)" 'DATA'
+        try {
+            $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction Stop
+            Write-Log "            LastRun : $($info.LastRunTime)" 'DATA'
+            Write-Log "            NextRun : $($info.NextRunTime)" 'DATA'
+            Write-Log "            LastResult: $($info.LastTaskResult)" 'DATA'
+        } catch {}
+    }
+}
+
+# Write file existence + hash check for key Defender binaries
+function Write-DefenderFiles {
+    param([string]$Label)
+    Write-Log "  -- Defender File Check: $Label --" 'STEP'
+    $files = @(
+        "$env:ProgramFiles\Windows Defender\MpCmdRun.exe",
+        "$env:ProgramFiles\Windows Defender\OFFmeansOFF.exe",
+        "$env:ProgramFiles\Windows Defender\MsMpEng.exe",
+        "$env:ProgramFiles\Windows Defender\NisSrv.exe",
+        "$env:ProgramData\Microsoft\Windows Defender\Scans\mpenginedb.db",
+        "$env:ProgramData\Microsoft\Windows Defender\Scans\History\Service",
+        "$env:windir\System32\smartscreen.exe",
+        "$env:windir\System32\SecurityHealthService.exe",
+        "$env:windir\System32\SecurityHealthSystray.exe"
+    )
+    foreach ($f in $files) {
+        if (Test-Path $f -PathType Leaf) {
+            try {
+                $hash = (Get-FileHash $f -Algorithm SHA256 -ErrorAction Stop).Hash
+                $fi   = Get-Item $f
+                Write-Log ("      EXISTS   {0,-65} {1,10} KB  SHA256={2}" -f $f, [math]::Round($fi.Length/1KB,1), $hash) 'DATA'
+            } catch {
+                Write-Log "      EXISTS   $f  (hash failed: $_)" 'WARN'
+            }
+        } elseif (Test-Path $f -PathType Container) {
+            $count = (Get-ChildItem $f -Recurse -File -ErrorAction SilentlyContinue).Count
+            Write-Log "      DIR      $f  ($count files inside)" 'DATA'
+        } else {
+            Write-Log "      MISSING  $f" 'DATA'
+        }
+    }
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# SCRIPT BANNER + INITIAL STATE CAPTURE
+# ════════════════════════════════════════════════════════════════════════════
+$ScriptStartTime = Get-Date
+
+Write-Log "DisableDefender Script — Execution Report" 'HEADER'
+Write-Log "Report file : $script:LogFile" 'INFO'
+Write-Log "Start time  : $($ScriptStartTime.ToString('yyyy-MM-dd HH:mm:ss.fff'))" 'INFO'
+Write-Log '' 'SEP'
+
+Write-SystemInfo
+
+Write-Log '' 'SEP'
+Write-Log "PRE-RUN STATE" 'HEADER'
+Write-ServiceSnapshot "PRE-RUN"
+Write-LogBlank
+Write-ProcessSnapshot "PRE-RUN"
+Write-LogBlank
+Write-DefenderRegistryState "PRE-RUN"
+Write-LogBlank
+Write-DefenderFiles "PRE-RUN"
+Write-LogBlank
+Write-DefenderTasks "PRE-RUN"
+Write-LogBlank
+Write-DefenderEvents 50
 
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]'Administrator')) {
+  Write-Log "Not running as Administrator — relaunching elevated..." 'WARN'
   Start-Process PowerShell.exe -ArgumentList ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`"" -f $PSCommandPath) -Verb RunAs
-  Exit	
+  Exit
 }
+
+Write-Log "Administrator privilege check: PASSED" 'SUCCESS'
 
 #reg files
 $file1 = @'
@@ -494,27 +843,72 @@ Windows Registry Editor Version 5.00
 
 #exploit trusted installer service bin path
 function Run-Trusted([String]$command) {
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-Log "  Run-Trusted ENTER" 'STEP'
+  Write-Log "      Command (plain)      : $command" 'DATA'
 
-  Stop-Service -Name TrustedInstaller -Force -ErrorAction SilentlyContinue
-  #get bin path to revert later
-  $service = Get-WmiObject -Class Win32_Service -Filter "Name='TrustedInstaller'"
-  $DefaultBinPath = $service.PathName
-  #convert command to base64 to avoid errors with spaces
-  $bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
+  # Pre-state: TrustedInstaller
+  $tiSvc = Get-WmiObject Win32_Service -Filter "Name='TrustedInstaller'" -ErrorAction SilentlyContinue
+  if ($null -eq $tiSvc) {
+    Write-Log "      TrustedInstaller WMI object NOT FOUND — cannot proceed!" 'ERROR'
+    return
+  }
+  $DefaultBinPath = $tiSvc.PathName
+  Write-Log "      TI state (pre)       : Status=$($tiSvc.State) StartMode=$($tiSvc.StartMode) PID=$($tiSvc.ProcessId)" 'DATA'
+  Write-Log "      TI binPath (original): $DefaultBinPath" 'DATA'
+
+  # Stop TI before hijacking
+  $stopOut = Stop-Service -Name TrustedInstaller -Force -ErrorAction SilentlyContinue 2>&1
+  Write-Log "      sc stop (pre)        : $stopOut" 'DATA'
+
+  # Encode command to base64
+  $bytes         = [System.Text.Encoding]::Unicode.GetBytes($command)
   $base64Command = [Convert]::ToBase64String($bytes)
-  #change bin to command
-  sc.exe config TrustedInstaller binPath= "cmd.exe /c powershell.exe -encodedcommand $base64Command" | Out-Null
-  #run the command
-  sc.exe start TrustedInstaller | Out-Null
-  #set bin back to default
-  sc.exe config TrustedInstaller binpath= "`"$DefaultBinPath`"" | Out-Null
-  Stop-Service -Name TrustedInstaller -Force -ErrorAction SilentlyContinue
+  Write-Log "      Base64 length        : $($base64Command.Length) chars" 'DATA'
 
+  # Hijack binPath
+  $newBin  = "cmd.exe /c powershell.exe -encodedcommand $base64Command"
+  $cfgOut  = sc.exe config TrustedInstaller binPath= $newBin 2>&1
+  Write-Log "      sc config result     : $cfgOut" 'DATA'
+
+  # Verify change
+  $tiPost = Get-WmiObject Win32_Service -Filter "Name='TrustedInstaller'" -ErrorAction SilentlyContinue
+  Write-Log "      TI binPath (new)     : $($tiPost.PathName)" 'DATA'
+
+  # Start to execute command
+  $startOut = sc.exe start TrustedInstaller 2>&1
+  Write-Log "      sc start result      : $startOut" 'DATA'
+  Start-Sleep -Milliseconds 800
+
+  # Restore original binPath
+  $restoreOut = sc.exe config TrustedInstaller binpath= "`"$DefaultBinPath`"" 2>&1
+  Write-Log "      sc restore result    : $restoreOut" 'DATA'
+
+  # Verify restore
+  $tiRestored = Get-WmiObject Win32_Service -Filter "Name='TrustedInstaller'" -ErrorAction SilentlyContinue
+  $restoredMatch = ($tiRestored.PathName -like "*trustedinstaller*")
+  Write-Log "      TI binPath (restored): $($tiRestored.PathName)  [match=$restoredMatch]" 'DATA'
+  if (-not $restoredMatch) {
+    Write-Log "      WARNING: binPath restore may have failed!" 'WARN'
+  }
+
+  # Final stop
+  Stop-Service -Name TrustedInstaller -Force -ErrorAction SilentlyContinue | Out-Null
+  $tiFinal = Get-WmiObject Win32_Service -Filter "Name='TrustedInstaller'" -ErrorAction SilentlyContinue
+  Write-Log "      TI state (post)      : Status=$($tiSvc.State)" 'DATA'
+
+  $sw.Stop()
+  Write-Log "  Run-Trusted EXIT  elapsed=$($sw.Elapsed.ToString('ss\.fff'))s" 'SUCCESS'
 }
 
 
 #refactor of https://github.com/AveYo/LeanAndMean/blob/main/disableDefender.ps1
 $code = @'
+$InnerLog = "$env:TEMP\DefeatDefend_inner_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+function IL { param([string]$M,[string]$L='INFO'); $e="[$(Get-Date -Format 'HH:mm:ss')] [$L] $M"; Add-Content $InnerLog $e -Encoding UTF8; Write-Host $e }
+IL "defeatMsMpEng inner script started" 'STEP'
+IL "Running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)" 'INFO'
+
 function defeatMsMpEng {
     
 $key = 'Registry::HKU\S-1-5-21-*\Volatile Environment'
@@ -571,9 +965,12 @@ $Z, (4 * $Z + 16) | ForEach-Object { $H += M "AllocHGlobal" $I $_ }
 
 # Check user and start service if necessary
 if ([environment]::username -ne "system") {
+    IL "Not running as SYSTEM (user: $([environment]::username)) — launching via TrustedInstaller impersonation..." 'WARN'
     $TI = "TrustedInstaller"
     Start-Service $TI -ErrorAction SilentlyContinue
     $As = Get-Process -Name $TI -ErrorAction SilentlyContinue
+    if ($null -eq $As) { IL "WARNING: TrustedInstaller process not found after Start-Service!" 'ERROR' }
+    else { IL "TrustedInstaller process found. PID: $($As.Id)" 'INFO' }
     M "WriteIntPtr" ($P, $P) ($H[0], $As.Handle)
     $A1.f1 = 131072
     $A1.f2 = $Z
@@ -588,11 +985,13 @@ if ([environment]::username -ne "system") {
     $A4.f2 = $H[1]
     M "StructureToPtr" ($D[2], $P, [boolean]) (($A2 -as $D[2]), $A4.f2, $false)
     $R = @($null, "powershell -nop -c iex(`$env:R); # $id", 0, 0, 0, 0x0E080610, 0, $null, ($A4 -as $T[4]), ($A5 -as $T[5]))
+    IL "CreateProcess call dispatched for SYSTEM elevation." 'INFO'
     F 'CreateProcess' $R
     return
 }
 
 # Clear environment variable
+IL "Running as SYSTEM — proceeding with defeatMsMpEng." 'SUCCESS'
 $env:R = ''
 Remove-ItemProperty -Path $key -Name $id -Force -ErrorAction SilentlyContinue
 
@@ -617,114 +1016,309 @@ function RegSetDwords ($hive, $key, [array]$values, [array]$dword, $REG_TYPE = 4
     $disable = 1
     $disable_rev = 0
     $disable_SMARTSCREENFILTER = 1
+    IL "Stopping wscsvc and killing MpCmdRun/OFFmeansOFF..." 'STEP'
     #stop security center and defender commandline exe
     stop-service 'wscsvc' -force -ErrorAction SilentlyContinue *>$null
     Stop-Process -name 'OFFmeansOFF', 'MpCmdRun' -force -ErrorAction SilentlyContinue
+    IL "Services/processes stopped." 'INFO'
  
     $HKLM = [uintptr][uint32]2147483650 
     $VALUES = 'ServiceKeepAlive', 'PreviousRunningMode', 'IsServiceRunning', 'DisableAntiSpyware', 'DisableAntiVirus', 'PassiveMode'
     $DWORDS = 0, 0, 0, $disable, $disable, $disable
+    IL "Applying registry values to Policies and Windows Defender keys..." 'STEP'
     #apply registry values (not all will apply)
     RegSetDwords $HKLM 'SOFTWARE\Policies\Microsoft\Windows Defender' $VALUES $DWORDS 
     RegSetDwords $HKLM 'SOFTWARE\Microsoft\Windows Defender' $VALUES $DWORDS
+    IL "Registry values applied." 'INFO'
     [GC]::Collect() 
     Start-Sleep 1
+
+    IL "Locating MpCmdRun.exe / OFFmeansOFF.exe in Windows Defender folder..." 'STEP'
     #run defender command line to disable msmpeng service
     Push-Location "$env:programfiles\Windows Defender"
     $mpcmdrun = ('OFFmeansOFF.exe', 'MpCmdRun.exe')[(test-path 'MpCmdRun.exe')]
+    IL "Using executable: $mpcmdrun" 'INFO'
     Start-Process -wait $mpcmdrun -args '-DisableService -HighPriority'
+    IL "DisableService command completed." 'INFO'
+
     #wait for service to close before continuing
     $wait = 14
     while ((get-process -name 'MsMpEng' -ea 0) -and $wait -gt 0) { 
+        IL "Waiting for MsMpEng to stop... ($wait seconds left)" 'INFO'
         $wait--
         Start-Sleep 1
     }
+    if (get-process -name 'MsMpEng' -ea 0) {
+        IL "WARNING: MsMpEng is STILL running after wait timeout!" 'WARN'
+    } else {
+        IL "MsMpEng is no longer running." 'SUCCESS'
+    }
  
+    IL "Renaming MpCmdRun.exe to OFFmeansOFF.exe..." 'STEP'
     #rename defender commandline exe
     $location = split-path $(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' ImagePath -ErrorAction SilentlyContinue).ImagePath.Trim('"')
+    IL "WinDefend image path location: $location" 'INFO'
     Push-Location $location
-    Rename-Item MpCmdRun.exe -NewName 'OFFmeansOFF.exe' -force -ErrorAction SilentlyContinue
+    try {
+        Rename-Item MpCmdRun.exe -NewName 'OFFmeansOFF.exe' -force -ErrorAction Stop
+        IL "Renamed MpCmdRun.exe -> OFFmeansOFF.exe" 'SUCCESS'
+    } catch {
+        IL "Failed to rename MpCmdRun.exe: $_" 'WARN'
+    }
  
+    IL "Cleaning up Defender scan history..." 'STEP'
     #cleanup scan history
     Remove-Item "$env:ProgramData\Microsoft\Windows Defender\Scans\mpenginedb.db" -force -ErrorAction SilentlyContinue
     Remove-Item "$env:ProgramData\Microsoft\Windows Defender\Scans\History\Service" -recurse -force -ErrorAction SilentlyContinue
+    IL "Scan history cleanup done." 'INFO'
 
+    IL "Re-applying registry values (now MsMpEng is stopped)..." 'STEP'
     #apply keys that are blocked when msmpeng is running
     RegSetDwords $HKLM 'SOFTWARE\Policies\Microsoft\Windows Defender' $VALUES $DWORDS 
     RegSetDwords $HKLM 'SOFTWARE\Microsoft\Windows Defender' $VALUES $DWORDS
+    IL "Post-kill registry values applied." 'SUCCESS'
 
     #disable smartscreen
     if ($disable_SMARTSCREENFILTER) {
-        Set-ItemProperty 'HKLM:\CurrentControlSet\Control\CI\Policy' 'VerifiedAndReputablePolicyState' 0 -type Dword -force -ErrorAction SilentlyContinue
-        Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled' 'Off' -force -ErrorAction SilentlyContinue 
+        IL "Disabling SmartScreen..." 'STEP'
+        try {
+            Set-ItemProperty 'HKLM:\CurrentControlSet\Control\CI\Policy' 'VerifiedAndReputablePolicyState' 0 -type Dword -force -ErrorAction Stop
+            IL "VerifiedAndReputablePolicyState set to 0" 'SUCCESS'
+        } catch { IL "Failed VerifiedAndReputablePolicyState: $_" 'WARN' }
+        try {
+            Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled' 'Off' -force -ErrorAction Stop
+            IL "SmartScreenEnabled set to Off" 'SUCCESS'
+        } catch { IL "Failed SmartScreenEnabled: $_" 'WARN' }
         Get-Item Registry::HKEY_Users\S-1-5-21*\Software\Microsoft -ea 0 | ForEach-Object {
-            Set-ItemProperty "$($_.PSPath)\Windows\CurrentVersion\AppHost" 'EnableWebContentEvaluation' $disable_rev -type Dword -force -ErrorAction SilentlyContinue
-            Set-ItemProperty "$($_.PSPath)\Windows\CurrentVersion\AppHost" 'PreventOverride' $disable_rev -type Dword -force -ErrorAction SilentlyContinue
-            New-Item "$($_.PSPath)\Edge\SmartScreenEnabled" -ErrorAction SilentlyContinue *>$null
-            Set-ItemProperty "$($_.PSPath)\Edge\SmartScreenEnabled" '(Default)' $disable_rev -ErrorAction SilentlyContinue
+            $userPath = $_.PSPath
+            IL "Processing user hive: $userPath" 'INFO'
+            try {
+                Set-ItemProperty "$userPath\Windows\CurrentVersion\AppHost" 'EnableWebContentEvaluation' $disable_rev -type Dword -force -ErrorAction SilentlyContinue
+                Set-ItemProperty "$userPath\Windows\CurrentVersion\AppHost" 'PreventOverride' $disable_rev -type Dword -force -ErrorAction SilentlyContinue
+                New-Item "$userPath\Edge\SmartScreenEnabled" -ErrorAction SilentlyContinue *>$null
+                Set-ItemProperty "$userPath\Edge\SmartScreenEnabled" '(Default)' $disable_rev -ErrorAction SilentlyContinue
+                IL "  AppHost/Edge SmartScreen disabled for $userPath" 'SUCCESS'
+            } catch {
+                IL "  Failed user SmartScreen settings for $userPath : $_" 'WARN'
+            }
         }
         if ($disable_rev -eq 0) { 
+            IL "Killing smartscreen process..." 'INFO'
             Stop-Process -name smartscreen -force -ErrorAction SilentlyContinue
         }
+        IL "SmartScreen disable complete." 'SUCCESS'
     }
 
 }
 defeatMsMpEng
+IL "defeatMsMpEng inner script finished. Log: $InnerLog" 'STEP'
 '@
 $script = New-Item "$env:TEMP\DefeatDefend.ps1" -Value $code -Force
+Write-Log "Temp defeatMsMpEng script written to: $($script.FullName)" 'INFO'
 $run = "Start-Process powershell.exe -ArgumentList `"-executionpolicy bypass -File $($script.FullName) -Verb runas`""
+Write-Log "Run command prepared: $run" 'INFO'
 
 
 Write-Host 'Running Initial Stage...'
+Start-Stage "Notification suppression and initial registry tweaks"
+
+# Quick service snapshot at stage start (full PRE-RUN was already captured above)
+Write-ServiceSnapshot "START OF STAGE 1"
 
 #disable notifications and others that are allowed while defender is running
-Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Notifications' /v 'DisableEnhancedNotifications' /t REG_DWORD /d '1' /f *>$null
-Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Notifications' /v 'DisableNotifications' /t REG_DWORD /d '1' /f *>$null
-Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection' /v 'SummaryNotificationDisabled' /t REG_DWORD /d '1' /f *>$null
-Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection' /v 'NoActionNotificationDisabled' /t REG_DWORD /d '1' /f *>$null
-Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection' /v 'FilesBlockedNotificationDisabled' /t REG_DWORD /d '1' /f *>$null
-Reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.SecurityAndMaintenance' /v 'Enabled' /t REG_DWORD /d '0' /f *>$null
+Invoke-Logged "Reg: DisableEnhancedNotifications" { Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Notifications' /v 'DisableEnhancedNotifications' /t REG_DWORD /d '1' /f 2>&1 }
+Invoke-Logged "Reg: DisableNotifications" { Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Notifications' /v 'DisableNotifications' /t REG_DWORD /d '1' /f 2>&1 }
+Invoke-Logged "Reg: SummaryNotificationDisabled" { Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection' /v 'SummaryNotificationDisabled' /t REG_DWORD /d '1' /f 2>&1 }
+Invoke-Logged "Reg: NoActionNotificationDisabled" { Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection' /v 'NoActionNotificationDisabled' /t REG_DWORD /d '1' /f 2>&1 }
+Invoke-Logged "Reg: FilesBlockedNotificationDisabled" { Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender Security Center\Virus and threat protection' /v 'FilesBlockedNotificationDisabled' /t REG_DWORD /d '1' /f 2>&1 }
+Invoke-Logged "Reg: SecurityAndMaintenance toast disable" { Reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.SecurityAndMaintenance' /v 'Enabled' /t REG_DWORD /d '0' /f 2>&1 }
+
 #exploit protection
-Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\Session Manager\kernel' /v 'MitigationOptions' /t REG_BINARY /d '222222000001000000000000000000000000000000000000' /f *>$null
+Invoke-Logged "Reg: MitigationOptions (exploit protection)" { Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\Session Manager\kernel' /v 'MitigationOptions' /t REG_BINARY /d '222222000001000000000000000000000000000000000000' /f 2>&1 }
+
+Write-Log "  Run-Trusted: PUAProtection = 0" 'STEP'
 Run-Trusted -command "Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender' /v 'PUAProtection' /t REG_DWORD /d '0' /f"
+Write-Log "  Run-Trusted: SmartScreenEnabled = Off" 'STEP'
 Run-Trusted -command "Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' /v 'SmartScreenEnabled' /t REG_SZ /d 'Off' /f"
+Write-Log "  Run-Trusted: AicEnabled = Anywhere" 'STEP'
 Run-Trusted -command "Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' /v 'AicEnabled' /t REG_SZ /d 'Anywhere' /f"
 
-Write-Host 'Disabling Defender with Registry Hacks...' 
+End-Stage "Notification suppression"
 
-New-item -Path "$env:TEMP\disableReg" -ItemType Directory -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable1.reg" -Value $file1 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable2.reg" -Value $file2 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable3.reg" -Value $file3 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable5.reg" -Value $file5 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable6.reg" -Value $file6 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable7.reg" -Value $file7 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable8.reg" -Value $file8 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable9.reg" -Value $file9 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable10.reg" -Value $file10 -Force | Out-Null
-New-Item -Path "$env:TEMP\disableReg\disable11.reg" -Value $file11 -Force | Out-Null
-$files = (Get-ChildItem -Path "$env:TEMP\disableReg").FullName
-foreach ($file in $files) {
-  $command = "Start-Process regedit.exe -ArgumentList `"/s $file`""
-  Run-Trusted -command $command
-  Start-Sleep 1
+Write-Host 'Disabling Defender with Registry Hacks...'
+Start-Stage "Writing and importing .reg files via TrustedInstaller"
+
+Invoke-Logged "Create temp directory $env:TEMP\disableReg" {
+    New-Item -Path "$env:TEMP\disableReg" -ItemType Directory -Force
 }
 
+$regFiles = @{
+  'disable1.reg'  = $file1
+  'disable2.reg'  = $file2
+  'disable3.reg'  = $file3
+  'disable5.reg'  = $file5
+  'disable6.reg'  = $file6
+  'disable7.reg'  = $file7
+  'disable8.reg'  = $file8
+  'disable9.reg'  = $file9
+  'disable10.reg' = $file10
+  'disable11.reg' = $file11
+}
 
-#attempt to kill defender processes and silence notifications from sec center
-$command = 'Stop-Process MpDefenderCoreService -Force; Stop-Process smartscreen -Force; Stop-Process SecurityHealthService -Force; Stop-Process SecurityHealthSystray -Force; Stop-Service -Name wscsvc -Force; Stop-Service -Name Sense -Force'
-Run-Trusted -command $command
-Run-Trusted -command $run
-
-#disable tasks
-$tasks = Get-ScheduledTask
-foreach ($task in $tasks) {
-  if ($task.Taskname -like 'Windows Defender*') {
-    Disable-ScheduledTask -TaskName $task.TaskName -ErrorAction SilentlyContinue
+foreach ($name in $regFiles.Keys | Sort-Object) {
+  $path = "$env:TEMP\disableReg\$name"
+  try {
+    New-Item -Path $path -Value $regFiles[$name] -Force | Out-Null
+    $size = (Get-Item $path).Length
+    Write-Log "  Written $name  ($size bytes) -> $path" 'SUCCESS'
+  } catch {
+    Write-Log "  FAILED to write $name : $_" 'ERROR'
   }
 }
 
+$files = (Get-ChildItem -Path "$env:TEMP\disableReg").FullName
+Write-Log "  Total .reg files to import: $($files.Count)" 'INFO'
+
+foreach ($file in $files) {
+  $fname = Split-Path $file -Leaf
+  Write-Log "  Importing $fname via TrustedInstaller regedit /s ..." 'STEP'
+  $command = "Start-Process regedit.exe -ArgumentList `"/s $file`" -Wait"
+  Run-Trusted -command $command
+  Start-Sleep 1
+  Write-Log "  Import done: $fname" 'SUCCESS'
+}
+
+End-Stage "Reg file imports"
+
+
+#attempt to kill defender processes and silence notifications from sec center
+Start-Stage "Kill Defender processes and services"
+Write-Log "  Sending kill/stop command via TrustedInstaller..." 'INFO'
+$command = 'Stop-Process -Name MpDefenderCoreService -Force -ErrorAction SilentlyContinue; Stop-Process -Name smartscreen -Force -ErrorAction SilentlyContinue; Stop-Process -Name SecurityHealthService -Force -ErrorAction SilentlyContinue; Stop-Process -Name SecurityHealthSystray -Force -ErrorAction SilentlyContinue; Stop-Service -Name wscsvc -Force -ErrorAction SilentlyContinue; Stop-Service -Name Sense -Force -ErrorAction SilentlyContinue'
+Run-Trusted -command $command
+
+Write-LogBlank
+Write-ProcessSnapshot "AFTER process kills"
+End-Stage "Process/service kills"
+
+Start-Stage "defeatMsMpEng — main Defender defeat (runs as SYSTEM via TrustedInstaller)"
+Write-Log "  Inner script path: $($script.FullName)" 'INFO'
+$innerScriptExists = Test-Path $script.FullName
+Write-Log "  Inner script exists on disk: $innerScriptExists" 'DATA'
+if ($innerScriptExists) {
+    $hash = (Get-FileHash $script.FullName -Algorithm SHA256).Hash
+    $size = (Get-Item $script.FullName).Length
+    Write-Log "  Inner script size  : $size bytes" 'DATA'
+    Write-Log "  Inner script SHA256: $hash" 'DATA'
+}
+Run-Trusted -command $run
+Write-Log "  defeatMsMpEng stage dispatched. The inner script runs asynchronously as SYSTEM." 'INFO'
+Write-Log "  Check '$env:TEMP\DefeatDefend_inner_*.log' for inner execution detail." 'INFO'
+End-Stage "defeatMsMpEng dispatch"
+
+Start-Stage "Disable Windows Defender scheduled tasks"
+$allTasks      = Get-ScheduledTask -ErrorAction SilentlyContinue
+$defenderTasks = $allTasks | Where-Object { $_.TaskName -like 'Windows Defender*' }
+Write-Log "  Total scheduled tasks on system   : $($allTasks.Count)" 'DATA'
+Write-Log "  Defender-related tasks found       : $($defenderTasks.Count)" 'DATA'
+foreach ($task in $defenderTasks) {
+  Write-Log "  Task: '$($task.TaskName)'  Path=$($task.TaskPath)  State=$($task.State)" 'INFO'
+  try {
+    Disable-ScheduledTask -TaskName $task.TaskName -ErrorAction Stop | Out-Null
+    $postState = (Get-ScheduledTask -TaskName $task.TaskName -ErrorAction SilentlyContinue).State
+    Write-Log "    Disabled OK  ->  new State: $postState" 'SUCCESS'
+  } catch {
+    Write-Log "    FAILED to disable: $_" 'ERROR'
+  }
+}
+Write-DefenderTasks "AFTER disable"
+End-Stage "Scheduled task disabling"
+
 
 Write-Host 'Cleaning Up...'
-Remove-Item "$env:TEMP\disableReg" -Recurse -Force
-Remove-Item "$env:TEMP\DefeatDefend.ps1" -Force
+Start-Stage "Cleanup temp files"
+
+try {
+  Remove-Item "$env:TEMP\disableReg" -Recurse -Force -ErrorAction Stop
+  Write-Log "  Removed: $env:TEMP\disableReg" 'SUCCESS'
+} catch {
+  Write-Log "  Could not remove $env:TEMP\disableReg : $_" 'WARN'
+}
+
+try {
+  Remove-Item "$env:TEMP\DefeatDefend.ps1" -Force -ErrorAction Stop
+  Write-Log "  Removed: $env:TEMP\DefeatDefend.ps1" 'SUCCESS'
+} catch {
+  Write-Log "  Could not remove $env:TEMP\DefeatDefend.ps1 : $_" 'WARN'
+}
+
+End-Stage "Cleanup"
+
+# ════════════════════════════════════════════════════════════════════════════
+# POST-RUN STATE CAPTURE
+# ════════════════════════════════════════════════════════════════════════════
+Write-Log "POST-RUN STATE" 'HEADER'
+Write-ServiceSnapshot "POST-RUN"
+Write-LogBlank
+Write-ProcessSnapshot "POST-RUN"
+Write-LogBlank
+Write-DefenderRegistryState "POST-RUN"
+Write-LogBlank
+Write-DefenderFiles "POST-RUN"
+Write-LogBlank
+Write-DefenderTasks "POST-RUN"
+Write-LogBlank
+Write-DefenderEvents 20
+
+# ════════════════════════════════════════════════════════════════════════════
+# EXECUTION SUMMARY
+# ════════════════════════════════════════════════════════════════════════════
+$ScriptEndTime = Get-Date
+$TotalElapsed  = $ScriptEndTime - $ScriptStartTime
+
+Write-Log "EXECUTION SUMMARY" 'HEADER'
+Write-Log "  Start time      : $($ScriptStartTime.ToString('yyyy-MM-dd HH:mm:ss.fff'))" 'DATA'
+Write-Log "  End time        : $($ScriptEndTime.ToString('yyyy-MM-dd HH:mm:ss.fff'))" 'DATA'
+Write-Log "  Total elapsed   : $($TotalElapsed.ToString('mm\:ss\.fff'))" 'DATA'
+Write-Log "  Stages completed: $($script:StageNum)" 'DATA'
+Write-LogBlank
+
+if ($script:Errors.Count -gt 0) {
+    Write-Log "  ERRORS ($($script:Errors.Count) total):" 'ERROR'
+    foreach ($e in $script:Errors) { Write-Log "    $e" 'ERROR' }
+} else {
+    Write-Log "  ERRORS: none" 'SUCCESS'
+}
+
+Write-LogBlank
+
+if ($script:Warnings.Count -gt 0) {
+    Write-Log "  WARNINGS ($($script:Warnings.Count) total):" 'WARN'
+    foreach ($w in $script:Warnings) { Write-Log "    $w" 'WARN' }
+} else {
+    Write-Log "  WARNINGS: none" 'SUCCESS'
+}
+
+Write-LogBlank
+
+# Inner script logs
+$innerLogs = Get-ChildItem "$env:TEMP\DefeatDefend_inner_*.log" -ErrorAction SilentlyContinue
+if ($innerLogs) {
+    Write-Log "  Inner script log(s) found:" 'INFO'
+    foreach ($il in $innerLogs) {
+        Write-Log "    $($il.FullName)  ($($il.Length) bytes)" 'DATA'
+        Write-Log "  -- Inner Log Contents: $($il.Name) --" 'STEP'
+        Get-Content $il.FullName | ForEach-Object { Write-Log "      $_" 'DATA' }
+    }
+} else {
+    Write-Log "  No inner DefeatDefend_inner_*.log found in TEMP (inner script may still be running, or ran before log was written)." 'WARN'
+}
+
+Write-Log '' 'SEP'
+Write-Log "  Full report saved to: $script:LogFile" 'SUCCESS'
+Write-Log '' 'SEP'
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "  Log saved to: $script:LogFile" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
