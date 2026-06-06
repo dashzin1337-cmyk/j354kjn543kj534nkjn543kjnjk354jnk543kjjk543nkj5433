@@ -280,7 +280,7 @@ function Write-DefenderTasks {
         Write-Log "            State   : $($t.State)" 'DATA'
         Write-Log "            URI     : $($t.URI)" 'DATA'
         try {
-            $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -ErrorAction Stop
+            $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop
             Write-Log "            LastRun : $($info.LastRunTime)" 'DATA'
             Write-Log "            NextRun : $($info.NextRunTime)" 'DATA'
             Write-Log "            LastResult: $($info.LastTaskResult)" 'DATA'
@@ -878,7 +878,29 @@ function Run-Trusted([String]$command) {
   # Start to execute command
   $startOut = sc.exe start TrustedInstaller 2>&1
   Write-Log "      sc start result      : $startOut" 'DATA'
-  Start-Sleep -Milliseconds 800
+
+  # Wait longer — SCM reports 1053 (timeout) but the payload (cmd->powershell) still runs.
+  # We need to let the payload finish before restoring binPath, otherwise it gets killed mid-run.
+  # Poll for TrustedInstaller to appear as a process, then wait for it to exit (max 30s).
+  $waited = 0
+  $maxWait = 30
+  while ($waited -lt $maxWait) {
+    Start-Sleep -Milliseconds 500
+    $tiProc = Get-Process -Name 'TrustedInstaller' -ErrorAction SilentlyContinue
+    if ($tiProc) {
+      Write-Log "      TI process appeared   : PID=$($tiProc.Id) (waiting for completion...)" 'DATA'
+      # Now wait for it to finish (payload runs inside cmd.exe child, TI exits when cmd exits)
+      $tiProc.WaitForExit(20000) | Out-Null
+      Write-Log "      TI process exited." 'DATA'
+      break
+    }
+    $waited++
+  }
+  if ($waited -ge $maxWait) {
+    Write-Log "      TI process never appeared — payload may have run via SCM timeout path." 'WARN'
+    # Still give it time — the cmd.exe child keeps running even after TI exits with 1053
+    Start-Sleep -Seconds 3
+  }
 
   # Restore original binPath
   $restoreOut = sc.exe config TrustedInstaller binpath= "`"$DefaultBinPath`"" 2>&1
@@ -1136,6 +1158,7 @@ Invoke-Logged "Reg: SecurityAndMaintenance toast disable" { Reg.exe add 'HKCU\So
 #exploit protection
 Invoke-Logged "Reg: MitigationOptions (exploit protection)" { Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\Session Manager\kernel' /v 'MitigationOptions' /t REG_BINARY /d '222222000001000000000000000000000000000000000000' /f 2>&1 }
 
+Write-Log "  NOTE: sc.exe error 1053 is expected behavior — the cmd->powershell payload runs after SCM timeout. binPath is restored safely regardless." 'INFO'
 Write-Log "  Run-Trusted: PUAProtection = 0" 'STEP'
 Run-Trusted -command "Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Defender' /v 'PUAProtection' /t REG_DWORD /d '0' /f"
 Write-Log "  Run-Trusted: SmartScreenEnabled = Off" 'STEP'
@@ -1212,8 +1235,11 @@ if ($innerScriptExists) {
     Write-Log "  Inner script SHA256: $hash" 'DATA'
 }
 Run-Trusted -command $run
-Write-Log "  defeatMsMpEng stage dispatched. The inner script runs asynchronously as SYSTEM." 'INFO'
-Write-Log "  Check '$env:TEMP\DefeatDefend_inner_*.log' for inner execution detail." 'INFO'
+Write-Log "  defeatMsMpEng stage dispatched." 'INFO'
+Write-Log "  NOTE: error 1053 from sc.exe is expected — the cmd->powershell payload runs async after SCM timeout." 'INFO'
+Write-Log "  Waiting 15 seconds for defeatMsMpEng inner script to complete..." 'INFO'
+Start-Sleep -Seconds 15
+Write-Log "  Wait complete. Check '$env:TEMP\DefeatDefend_inner_*.log' for inner execution detail." 'INFO'
 End-Stage "defeatMsMpEng dispatch"
 
 Start-Stage "Disable Windows Defender scheduled tasks"
@@ -1224,8 +1250,8 @@ Write-Log "  Defender-related tasks found       : $($defenderTasks.Count)" 'DATA
 foreach ($task in $defenderTasks) {
   Write-Log "  Task: '$($task.TaskName)'  Path=$($task.TaskPath)  State=$($task.State)" 'INFO'
   try {
-    Disable-ScheduledTask -TaskName $task.TaskName -ErrorAction Stop | Out-Null
-    $postState = (Get-ScheduledTask -TaskName $task.TaskName -ErrorAction SilentlyContinue).State
+    Disable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop | Out-Null
+    $postState = (Get-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue).State
     Write-Log "    Disabled OK  ->  new State: $postState" 'SUCCESS'
   } catch {
     Write-Log "    FAILED to disable: $_" 'ERROR'
