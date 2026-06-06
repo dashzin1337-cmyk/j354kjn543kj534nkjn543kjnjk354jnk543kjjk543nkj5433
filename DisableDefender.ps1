@@ -1237,9 +1237,43 @@ if ($innerScriptExists) {
 Run-Trusted -command $run
 Write-Log "  defeatMsMpEng stage dispatched." 'INFO'
 Write-Log "  NOTE: error 1053 from sc.exe is expected — the cmd->powershell payload runs async after SCM timeout." 'INFO'
-Write-Log "  Waiting 15 seconds for defeatMsMpEng inner script to complete..." 'INFO'
-Start-Sleep -Seconds 15
-Write-Log "  Wait complete. Check '$env:TEMP\DefeatDefend_inner_*.log' for inner execution detail." 'INFO'
+
+# The inner script needs to: get a SYSTEM token via CreateProcess, re-launch itself as true SYSTEM,
+# then call MpCmdRun -DisableService. This multi-hop can take 30-90 seconds.
+# We poll MsMpEng until it stops (or timeout).
+Write-Log "  Waiting for MsMpEng (PID=$((Get-Process MsMpEng -ea 0).Id)) to stop (max 120s)..." 'INFO'
+$waited = 0
+$msmpengStopped = $false
+while ($waited -lt 120) {
+    Start-Sleep -Seconds 2
+    $waited += 2
+    $mp = Get-Process -Name 'MsMpEng' -ErrorAction SilentlyContinue
+    if (-not $mp) {
+        Write-Log "  MsMpEng stopped after ${waited}s!" 'SUCCESS'
+        $msmpengStopped = $true
+        break
+    }
+    if ($waited % 10 -eq 0) {
+        Write-Log "  MsMpEng still running at ${waited}s... PID=$($mp.Id) CPU=$([math]::Round($mp.TotalProcessorTime.TotalSeconds,1))s WS=$([math]::Round($mp.WorkingSet64/1MB,1))MB" 'INFO'
+    }
+}
+if (-not $msmpengStopped) {
+    Write-Log "  WARNING: MsMpEng did NOT stop within 120s. defeatMsMpEng likely failed to get SYSTEM token." 'WARN'
+    Write-Log "  Check '$env:TEMP\DefeatDefend_inner_*.log' for details." 'WARN'
+}
+
+# Also check for the inner log file
+Start-Sleep -Seconds 3
+$innerLogs = Get-ChildItem "$env:TEMP\DefeatDefend_inner_*.log" -ErrorAction SilentlyContinue
+if ($innerLogs) {
+    foreach ($il in $innerLogs) {
+        Write-Log "  Inner log found: $($il.FullName) ($($il.Length) bytes)" 'SUCCESS'
+        Write-Log "  -- Inner Log Contents --" 'STEP'
+        Get-Content $il.FullName | ForEach-Object { Write-Log "    $_" 'DATA' }
+    }
+} else {
+    Write-Log "  No inner DefeatDefend_inner_*.log found yet." 'WARN'
+}
 End-Stage "defeatMsMpEng dispatch"
 
 Start-Stage "Disable Windows Defender scheduled tasks"
@@ -1327,17 +1361,15 @@ if ($script:Warnings.Count -gt 0) {
 
 Write-LogBlank
 
-# Inner script logs
-$innerLogs = Get-ChildItem "$env:TEMP\DefeatDefend_inner_*.log" -ErrorAction SilentlyContinue
-if ($innerLogs) {
-    Write-Log "  Inner script log(s) found:" 'INFO'
-    foreach ($il in $innerLogs) {
+# Inner script logs — check again at summary time for anything that appeared late
+$innerLogsLate = Get-ChildItem "$env:TEMP\DefeatDefend_inner_*.log" -ErrorAction SilentlyContinue
+if ($innerLogsLate) {
+    Write-Log "  Inner script log(s) present at summary time: $($innerLogsLate.Count)" 'INFO'
+    foreach ($il in $innerLogsLate) {
         Write-Log "    $($il.FullName)  ($($il.Length) bytes)" 'DATA'
-        Write-Log "  -- Inner Log Contents: $($il.Name) --" 'STEP'
-        Get-Content $il.FullName | ForEach-Object { Write-Log "      $_" 'DATA' }
     }
 } else {
-    Write-Log "  No inner DefeatDefend_inner_*.log found in TEMP (inner script may still be running, or ran before log was written)." 'WARN'
+    Write-Log "  No inner DefeatDefend_inner_*.log found at summary time." 'WARN'
 }
 
 Write-Log '' 'SEP'
