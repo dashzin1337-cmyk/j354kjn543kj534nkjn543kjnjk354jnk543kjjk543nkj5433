@@ -1224,76 +1224,113 @@ Write-LogBlank
 Write-ProcessSnapshot "AFTER process kills"
 End-Stage "Process/service kills"
 
-Start-Stage "Strip PPL + disable WinDefend for next boot (requires reboot to complete)"
+Start-Stage "Strip PPL + delete WinDefend service key via PowerRun (SYSTEM token)"
 
-# PPL (LaunchProtected=3) on WinDefend is kernel-enforced at runtime.
-# Even TrustedInstaller (service hijack) can't write the WinDefend service key while MsMpEng is running.
-# BUT: NSudoLG.exe is already on this machine (used by moonlight-tweaks) and runs with -U:T -P:E
-# (TrustedInstaller + all privileges enabled). This is a real TI token, not the hijacked service,
-# and it successfully writes protected keys as proven by the moonlight-tweaks AI removal step.
+# The approach from windows-defender-remover:
+# PowerRun.exe launches processes as true NT AUTHORITY\SYSTEM with all privileges,
+# bypassing the DACL that protects the WinDefend service key at runtime.
+# It deletes the entire WinDefend service key (not just modifies it) so on next boot there's no service.
 
-$nSudo = "C:\Windows\mnl\rsc\su\NSudoLG.exe"
-$nSudoAvailable = Test-Path $nSudo
+# Locate PowerRun.exe — it's bundled in the repo
+$powerRunPaths = @(
+    "$PSScriptRoot\windows-defender-remover-release13\PowerRun.exe",
+    "C:\Windows\mnl\rsc\su\NSudoLG.exe",
+    "windows-defender-remover-release13\PowerRun.exe"
+)
+$powerRun = $null
+foreach ($p in $powerRunPaths) {
+    if (Test-Path $p) { $powerRun = $p; break }
+}
 
-if ($nSudoAvailable) {
-    Write-Log "  NSudoLG.exe found — using it to strip PPL and disable WinDefend service." 'SUCCESS'
+# Also check relative to script location
+$scriptDir = Split-Path $PSCommandPath -Parent
+if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+if (-not $powerRun) {
+    $candidate = Join-Path $scriptDir "windows-defender-remover-release13\PowerRun.exe"
+    if (Test-Path $candidate) { $powerRun = $candidate }
+}
+# Check current working directory too
+if (-not $powerRun) {
+    $candidate = Join-Path (Get-Location).Path "windows-defender-remover-release13\PowerRun.exe"
+    if (Test-Path $candidate) { $powerRun = $candidate }
+}
 
-    $pplScript = "$env:TEMP\strip_ppl.cmd"
-    Set-Content $pplScript -Encoding ASCII -Value @"
+Write-Log "  PowerRun.exe path: $powerRun" 'DATA'
+Write-Log "  PowerRun.exe found: $(Test-Path $powerRun)" 'DATA'
+
+if ($powerRun -and (Test-Path $powerRun)) {
+    Write-Log "  PowerRun.exe found — using SYSTEM token to delete WinDefend service key." 'SUCCESS'
+
+    # Write a reg file that deletes the entire WinDefend service key (and related Wd* services)
+    $delSvcReg = "$env:TEMP\delete_windefend.reg"
+    Set-Content $delSvcReg -Encoding Unicode -Value @"
+Windows Registry Editor Version 5.00
+
+[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WinDefend]
+[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdNisSvc]
+[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdNisDrv]
+[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdFilter]
+[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdBoot]
+[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WinDefend]
+[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdNisSvc]
+[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdNisDrv]
+[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdFilter]
+[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdBoot]
+
+"@
+
+    Write-Log "  Running: PowerRun regedit /s delete_windefend.reg..." 'STEP'
+    $pr1 = Start-Process -FilePath $powerRun -ArgumentList "regedit.exe /s `"$delSvcReg`"" -Wait -PassThru -ErrorAction SilentlyContinue
+    Write-Log "  PowerRun exit code: $($pr1.ExitCode)" 'DATA'
+
+    # Verify
+    $wdKeyGone = -not (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend')
+    Write-Log "  WinDefend service key deleted: $wdKeyGone" 'DATA'
+
+    # Also import all the policy regs from the defender remover repo via PowerRun
+    $defRemoverDir = Split-Path $powerRun -Parent
+    $policyRegs = Get-ChildItem "$defRemoverDir\Remove_Defender\*.reg" -ErrorAction SilentlyContinue
+    Write-Log "  Found $($policyRegs.Count) policy reg files in Remove_Defender\..." 'DATA'
+    foreach ($reg in $policyRegs) {
+        Write-Log "  PowerRun regedit /s $($reg.Name)..." 'STEP'
+        $pr = Start-Process -FilePath $powerRun -ArgumentList "regedit.exe /s `"$($reg.FullName)`"" -Wait -PassThru -ErrorAction SilentlyContinue
+        Write-Log "  Exit: $($pr.ExitCode)" 'DATA'
+        # Also run without PowerRun for keys that don't need SYSTEM
+        Start-Process regedit.exe -ArgumentList "/s `"$($reg.FullName)`"" -Wait -ErrorAction SilentlyContinue
+    }
+
+    Remove-Item $delSvcReg -Force -ErrorAction SilentlyContinue
+
+    if ($wdKeyGone) {
+        Write-Log "  WinDefend service key DELETED. After reboot MsMpEng will NOT start." 'SUCCESS'
+    } else {
+        Write-Log "  WinDefend key still present — kernel may have re-created it. Reboot still needed." 'WARN'
+    }
+
+} else {
+    Write-Log "  PowerRun.exe not found. Falling back to NSudoLG strip_ppl approach." 'WARN'
+    $nSudo = "C:\Windows\mnl\rsc\su\NSudoLG.exe"
+    if (Test-Path $nSudo) {
+        $pplScript = "$env:TEMP\strip_ppl.cmd"
+        Set-Content $pplScript -Encoding ASCII -Value @"
 reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f
 reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f
 reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f
 reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdNisSvc" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\ControlSet001\Services\WdNisSvc" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdFilter" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\ControlSet001\Services\WdFilter" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdBoot" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\ControlSet001\Services\WdBoot" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdNisDrv" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\ControlSet001\Services\WdNisDrv" /v Start /t REG_DWORD /d 4 /f
 "@
-
-    Write-Log "  Executing strip_ppl.cmd via NSudoLG -U:T -P:E -Wait..." 'STEP'
-    $nsudoProc = Start-Process -FilePath $nSudo -ArgumentList "-U:T -P:E -Wait `"$pplScript`"" -Wait -PassThru -ErrorAction SilentlyContinue
-    Write-Log "  NSudoLG exit code: $($nsudoProc.ExitCode)" 'DATA'
-    Remove-Item $pplScript -Force -ErrorAction SilentlyContinue
-
-} else {
-    Write-Log "  NSudoLG.exe NOT found at $nSudo — cannot use NSudo method." 'WARN'
-    Write-Log "  Trying direct reg write (will fail at runtime but recorded for diagnosis)..." 'INFO'
-    $r1 = reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f 2>&1
-    $r2 = reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f 2>&1
-    Write-Log "  Direct LaunchProtected result: $r1" 'DATA'
-    Write-Log "  Direct Start result          : $r2" 'DATA'
+        Start-Process -FilePath $nSudo -ArgumentList "-U:T -P:E -Wait `"$pplScript`"" -Wait -ErrorAction SilentlyContinue
+        Remove-Item $pplScript -Force -ErrorAction SilentlyContinue
+    }
 }
 
-# Verify
-$ppCurrent = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
-$stCurrent = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name Start -ea 0).Start
-$ppCs1     = (Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
-$stCs1     = (Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Services\WinDefend' -Name Start -ea 0).Start
-Write-Log "  VERIFY CurrentControlSet: LaunchProtected=$ppCurrent  Start=$stCurrent  (want: 0, 4)" 'DATA'
-Write-Log "  VERIFY ControlSet001    : LaunchProtected=$ppCs1      Start=$stCs1      (want: 0, 4)" 'DATA'
+# Verify final state
+$ppFinal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
+$stFinal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name Start -ea 0).Start
+$keyExists = Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend'
+Write-Log "  FINAL: WinDefend key exists=$keyExists  LaunchProtected=$ppFinal  Start=$stFinal" 'DATA'
+Write-Log "  *** REBOOT REQUIRED to complete Defender removal. ***" 'WARN'
 
-if (($ppCurrent -eq 0 -or $ppCs1 -eq 0) -and ($stCurrent -eq 4 -or $stCs1 -eq 4)) {
-    Write-Log "  PPL stripped + Start=Disabled. REBOOT to complete — MsMpEng will NOT start next boot." 'SUCCESS'
-} else {
-    Write-Log "  PPL write still blocked. Defender policy keys (disable1-11.reg) ARE applied — real-time protection is off." 'WARN'
-    Write-Log "  For full MsMpEng removal: reboot into WinRE or use offline registry editing." 'INFO'
-}
-
-# MpCmdRun -DisableService best-effort
-$mpPath = "$env:ProgramFiles\Windows Defender"
-if (Test-Path "$mpPath\MpCmdRun.exe") {
-    Write-Log "  Attempting MpCmdRun -DisableService..." 'STEP'
-    $proc = Start-Process -FilePath "$mpPath\MpCmdRun.exe" -ArgumentList "-DisableService -HighPriority" -Wait -PassThru -ErrorAction SilentlyContinue
-    Write-Log "  MpCmdRun exit code: $($proc.ExitCode)" 'DATA'
-}
-
-Write-Log "  *** REBOOT REQUIRED to complete WinDefend disable. ***" 'WARN'
-
-End-Stage "PPL strip + WinDefend disable (reboot required)"
+End-Stage "PowerRun WinDefend service key deletion (reboot required)"
 
 
 Start-Stage "Disable Windows Defender scheduled tasks"
