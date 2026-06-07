@@ -1224,42 +1224,27 @@ Write-LogBlank
 Write-ProcessSnapshot "AFTER process kills"
 End-Stage "Process/service kills"
 
-Start-Stage "Strip PPL + delete WinDefend service key via PowerRun (SYSTEM token)"
+Start-Stage "Strip PPL + delete WinDefend service key via SYSTEM-token tool"
 
-# The approach from windows-defender-remover:
-# PowerRun.exe launches processes as true NT AUTHORITY\SYSTEM with all privileges,
-# bypassing the DACL that protects the WinDefend service key at runtime.
-# It deletes the entire WinDefend service key (not just modifies it) so on next boot there's no service.
+# Try PowerRun first, then NSudoLG — both get true SYSTEM with all privileges.
+# NSudoLG args: -U:T -P:E -Wait <cmd>
+# PowerRun args: <cmd>  (no flags needed)
+$elevationTool = $null
+$useNSudo      = $false
 
-# Locate PowerRun.exe — it's bundled in the repo
-$powerRunPaths = @(
-    "C:\Windows\mnl\rsc\su\PowerRun.exe"
-)
-$powerRun = $null
-foreach ($p in $powerRunPaths) {
-    if (Test-Path $p) { $powerRun = $p; break }
+if (Test-Path "C:\Windows\mnl\rsc\su\PowerRun.exe") {
+    $elevationTool = "C:\Windows\mnl\rsc\su\PowerRun.exe"
+    $useNSudo      = $false
+} elseif (Test-Path "C:\Windows\mnl\rsc\su\NSudoLG.exe") {
+    $elevationTool = "C:\Windows\mnl\rsc\su\NSudoLG.exe"
+    $useNSudo      = $true
 }
 
-# Also check relative to script location
-$scriptDir = Split-Path $PSCommandPath -Parent
-if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
-if (-not $powerRun) {
-    $candidate = Join-Path $scriptDir "windows-defender-remover-release13\PowerRun.exe"
-    if (Test-Path $candidate) { $powerRun = $candidate }
-}
-# Check current working directory too
-if (-not $powerRun) {
-    $candidate = Join-Path (Get-Location).Path "windows-defender-remover-release13\PowerRun.exe"
-    if (Test-Path $candidate) { $powerRun = $candidate }
-}
+Write-Log "  Elevation tool: $elevationTool  (NSudo=$useNSudo)" 'DATA'
 
-Write-Log "  PowerRun.exe path: $powerRun" 'DATA'
-Write-Log "  PowerRun.exe found: $(Test-Path $powerRun)" 'DATA'
+if ($elevationTool) {
+    Write-Log "  Using $([System.IO.Path]::GetFileName($elevationTool)) to delete WinDefend service key." 'SUCCESS'
 
-if ($powerRun -and (Test-Path $powerRun)) {
-    Write-Log "  PowerRun.exe found — using SYSTEM token to delete WinDefend service key." 'SUCCESS'
-
-    # Write reg file that deletes WinDefend service keys entirely
     $delSvcReg = "$env:TEMP\delete_windefend.reg"
     $regContent = "Windows Registry Editor Version 5.00`r`n`r`n" +
                   "[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WinDefend]`r`n" +
@@ -1273,48 +1258,40 @@ if ($powerRun -and (Test-Path $powerRun)) {
                   "[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdFilter]`r`n" +
                   "[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdBoot]`r`n"
     [System.IO.File]::WriteAllText($delSvcReg, $regContent, [System.Text.Encoding]::Unicode)
-    Write-Log "  Reg file written: $delSvcReg ($((Get-Item $delSvcReg).Length) bytes)" 'DATA'
+    Write-Log "  Reg file: $delSvcReg ($((Get-Item $delSvcReg).Length) bytes)" 'DATA'
 
-    Write-Log "  Running: PowerRun regedit /s delete_windefend.reg..." 'STEP'
-    $pr1 = Start-Process -FilePath $powerRun -ArgumentList "regedit.exe /s `"$delSvcReg`"" -Wait -PassThru -ErrorAction SilentlyContinue
-    Write-Log "  PowerRun exit code: $($pr1.ExitCode)" 'DATA'
+    if ($useNSudo) {
+        $toolArgs = "-U:T -P:E -Wait regedit.exe /s `"$delSvcReg`""
+    } else {
+        $toolArgs = "regedit.exe /s `"$delSvcReg`""
+    }
+
+    Write-Log "  Running: $([System.IO.Path]::GetFileName($elevationTool)) $toolArgs" 'STEP'
+    $pr1 = Start-Process -FilePath $elevationTool -ArgumentList $toolArgs -Wait -PassThru -ErrorAction SilentlyContinue
+    Write-Log "  Exit code: $($pr1.ExitCode)" 'DATA'
     Start-Sleep -Seconds 1
     Remove-Item $delSvcReg -Force -ErrorAction SilentlyContinue
 
-    # Verify
     $wdKeyGone = -not (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend')
     Write-Log "  WinDefend service key deleted: $wdKeyGone" 'DATA'
 
     if ($wdKeyGone) {
-        Write-Log "  WinDefend service key DELETED. After reboot MsMpEng will NOT start." 'SUCCESS'
+        Write-Log "  WinDefend key DELETED. After reboot MsMpEng will NOT start." 'SUCCESS'
     } else {
-        Write-Log "  WinDefend key still present in memory — reboot to confirm deletion." 'WARN'
+        Write-Log "  Key still in memory (running service holds it open) — reboot to confirm deletion." 'WARN'
     }
 
 } else {
-    Write-Log "  PowerRun.exe not found. Falling back to NSudoLG strip_ppl approach." 'WARN'
-    $nSudo = "C:\Windows\mnl\rsc\su\NSudoLG.exe"
-    if (Test-Path $nSudo) {
-        $pplScript = "$env:TEMP\strip_ppl.cmd"
-        Set-Content $pplScript -Encoding ASCII -Value @"
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f
-reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f
-reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f
-"@
-        Start-Process -FilePath $nSudo -ArgumentList "-U:T -P:E -Wait `"$pplScript`"" -Wait -ErrorAction SilentlyContinue
-        Remove-Item $pplScript -Force -ErrorAction SilentlyContinue
-    }
+    Write-Log "  No elevation tool found at C:\Windows\mnl\rsc\su\. Cannot delete WinDefend key." 'WARN'
 }
 
-# Verify final state
-$ppFinal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
-$stFinal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name Start -ea 0).Start
 $keyExists = Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend'
+$ppFinal   = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
+$stFinal   = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name Start -ea 0).Start
 Write-Log "  FINAL: WinDefend key exists=$keyExists  LaunchProtected=$ppFinal  Start=$stFinal" 'DATA'
 Write-Log "  *** REBOOT REQUIRED to complete Defender removal. ***" 'WARN'
 
-End-Stage "PowerRun WinDefend service key deletion (reboot required)"
+End-Stage "SYSTEM-token WinDefend key deletion (reboot required)"
 
 
 Start-Stage "Disable Windows Defender scheduled tasks"
