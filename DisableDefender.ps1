@@ -1224,27 +1224,40 @@ Write-LogBlank
 Write-ProcessSnapshot "AFTER process kills"
 End-Stage "Process/service kills"
 
-Start-Stage "defeatMsMpEng — main Defender defeat (runs as SYSTEM via TrustedInstaller)"
-Write-Log "  Inner script path: $($script.FullName)" 'INFO'
-$innerScriptExists = Test-Path $script.FullName
-Write-Log "  Inner script exists on disk: $innerScriptExists" 'DATA'
-if ($innerScriptExists) {
-    $hash = (Get-FileHash $script.FullName -Algorithm SHA256).Hash
-    $size = (Get-Item $script.FullName).Length
-    Write-Log "  Inner script size  : $size bytes" 'DATA'
-    Write-Log "  Inner script SHA256: $hash" 'DATA'
-}
-Run-Trusted -command $run
-Write-Log "  defeatMsMpEng stage dispatched." 'INFO'
-Write-Log "  NOTE: error 1053 from sc.exe is expected — the cmd->powershell payload runs async after SCM timeout." 'INFO'
+Start-Stage "Stop WinDefend service and neutralize MsMpEng"
 
-# The inner script needs to: get a SYSTEM token via CreateProcess, re-launch itself as true SYSTEM,
-# then call MpCmdRun -DisableService. This multi-hop can take 30-90 seconds.
-# We poll MsMpEng until it stops (or timeout).
-Write-Log "  Waiting for MsMpEng (PID=$((Get-Process MsMpEng -ea 0).Id)) to stop (max 120s)..." 'INFO'
+# The defeatMsMpEng CreateProcess token-theft approach is broken on Windows 11 26H2+ (build 26200+).
+# TrustedInstaller's handle can no longer be duplicated for SYSTEM impersonation via P/Invoke on this build.
+# Instead we directly stop the WinDefend service via sc.exe run through TrustedInstaller,
+# and strip LaunchProtected (PPL) from the registry so it cannot restart with protection.
+
+Write-Log "  Step 1: Remove PPL (LaunchProtected) from WinDefend service registry via TrustedInstaller" 'STEP'
+$pplCmd = "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend`" /v LaunchProtected /t REG_DWORD /d 0 /f"
+Run-Trusted -command $pplCmd
+
+# Verify PPL was cleared
+$pplVal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ErrorAction SilentlyContinue).LaunchProtected
+Write-Log "  WinDefend LaunchProtected after change: $pplVal (0 = PPL disabled)" 'DATA'
+
+Write-Log "  Step 2: Set WinDefend start type to Disabled via TrustedInstaller" 'STEP'
+Run-Trusted -command "sc.exe config WinDefend start= disabled"
+
+# Verify
+$wdSvc = Get-WmiObject Win32_Service -Filter "Name='WinDefend'" -ErrorAction SilentlyContinue
+Write-Log "  WinDefend StartMode after change: $($wdSvc.StartMode)" 'DATA'
+
+Write-Log "  Step 3: Stop WinDefend service via TrustedInstaller" 'STEP'
+Run-Trusted -command "sc.exe stop WinDefend"
+
+# Also disable DisableAntiSpyware/DisableAntiVirus directly in the non-policy key (needs TI)
+Write-Log "  Step 4: Set DisableAntiSpyware + DisableAntiVirus in Windows Defender key" 'STEP'
+$disableCmd = "reg add `"HKLM\SOFTWARE\Microsoft\Windows Defender`" /v DisableAntiSpyware /t REG_DWORD /d 1 /f & reg add `"HKLM\SOFTWARE\Microsoft\Windows Defender`" /v DisableAntiVirus /t REG_DWORD /d 1 /f"
+Run-Trusted -command $disableCmd
+
+Write-Log "  Step 5: Polling for MsMpEng to stop (max 60s)..." 'INFO'
 $waited = 0
 $msmpengStopped = $false
-while ($waited -lt 120) {
+while ($waited -lt 60) {
     Start-Sleep -Seconds 2
     $waited += 2
     $mp = Get-Process -Name 'MsMpEng' -ErrorAction SilentlyContinue
@@ -1255,26 +1268,35 @@ while ($waited -lt 120) {
     }
     if ($waited % 10 -eq 0) {
         Write-Log "  MsMpEng still running at ${waited}s... PID=$($mp.Id) CPU=$([math]::Round($mp.TotalProcessorTime.TotalSeconds,1))s WS=$([math]::Round($mp.WorkingSet64/1MB,1))MB" 'INFO'
+        # Retry stop on each 10s interval
+        Run-Trusted -command "sc.exe stop WinDefend"
     }
 }
 if (-not $msmpengStopped) {
-    Write-Log "  WARNING: MsMpEng did NOT stop within 120s. defeatMsMpEng likely failed to get SYSTEM token." 'WARN'
-    Write-Log "  Check '$env:TEMP\DefeatDefend_inner_*.log' for details." 'WARN'
+    Write-Log "  MsMpEng still running after 60s. Logging final service state:" 'WARN'
+    $wdFinal = Get-WmiObject Win32_Service -Filter "Name='WinDefend'" -ErrorAction SilentlyContinue
+    Write-Log "  WinDefend: State=$($wdFinal.State) StartMode=$($wdFinal.StartMode) LaunchProtected=$(
+        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
+    )" 'WARN'
 }
 
-# Also check for the inner log file
-Start-Sleep -Seconds 3
-$innerLogs = Get-ChildItem "$env:TEMP\DefeatDefend_inner_*.log" -ErrorAction SilentlyContinue
-if ($innerLogs) {
-    foreach ($il in $innerLogs) {
-        Write-Log "  Inner log found: $($il.FullName) ($($il.Length) bytes)" 'SUCCESS'
-        Write-Log "  -- Inner Log Contents --" 'STEP'
-        Get-Content $il.FullName | ForEach-Object { Write-Log "    $_" 'DATA' }
+# Also run the original defeatMsMpEng for the RegSetDwords it does, even if the process-kill part fails
+Write-Log "  Step 6: Running original defeatMsMpEng script (for registry path, may partial-succeed)" 'STEP'
+if (Test-Path $script.FullName) {
+    Run-Trusted -command $run
+    Start-Sleep -Seconds 5
+    $innerLogs = Get-ChildItem "$env:TEMP\DefeatDefend_inner_*.log" -ErrorAction SilentlyContinue
+    if ($innerLogs) {
+        foreach ($il in $innerLogs) {
+            Write-Log "  Inner log: $($il.FullName) ($($il.Length) bytes)" 'SUCCESS'
+            Get-Content $il.FullName | ForEach-Object { Write-Log "    $_" 'DATA' }
+        }
+    } else {
+        Write-Log "  No inner log found (CreateProcess token-theft likely failed on this build — expected)." 'INFO'
     }
-} else {
-    Write-Log "  No inner DefeatDefend_inner_*.log found yet." 'WARN'
 }
-End-Stage "defeatMsMpEng dispatch"
+
+End-Stage "WinDefend stop + PPL removal"
 
 Start-Stage "Disable Windows Defender scheduled tasks"
 $allTasks      = Get-ScheduledTask -ErrorAction SilentlyContinue
