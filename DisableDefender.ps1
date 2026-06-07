@@ -1226,40 +1226,49 @@ End-Stage "Process/service kills"
 
 Start-Stage "Strip PPL + disable WinDefend for next boot (requires reboot to complete)"
 
-# PPL (LaunchProtected=3) on WinDefend is enforced by the kernel at runtime.
-# No user-mode code — not even TrustedInstaller — can change it while MsMpEng is running.
-# Strategy: write the registry keys now so they take effect on next boot BEFORE MsMpEng loads.
+# PPL (LaunchProtected=3) on WinDefend is kernel-enforced at runtime.
+# Even TrustedInstaller (service hijack) can't write the WinDefend service key while MsMpEng is running.
+# BUT: NSudoLG.exe is already on this machine (used by moonlight-tweaks) and runs with -U:T -P:E
+# (TrustedInstaller + all privileges enabled). This is a real TI token, not the hijacked service,
+# and it successfully writes protected keys as proven by the moonlight-tweaks AI removal step.
 
-Write-Log "  Writing LaunchProtected=0 directly (takes effect after reboot)..." 'STEP'
-# Try direct reg write first (works if WinDefend is not PPL-guarding its own key at this point)
-$pplDirect = reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f 2>&1
-Write-Log "  Direct reg result: $pplDirect" 'DATA'
+$nSudo = "C:\Windows\mnl\rsc\su\NSudoLG.exe"
+$nSudoAvailable = Test-Path $nSudo
 
-# Also try via TrustedInstaller
-Run-Trusted -command "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend`" /v LaunchProtected /t REG_DWORD /d 0 /f"
+if ($nSudoAvailable) {
+    Write-Log "  NSudoLG.exe found — using it to strip PPL and disable WinDefend service." 'SUCCESS'
 
-# Also write to ControlSet001 (persists across reboots regardless of CurrentControlSet)
-$pplCs1 = reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f 2>&1
-Write-Log "  ControlSet001 reg result: $pplCs1" 'DATA'
-Run-Trusted -command "reg add `"HKLM\SYSTEM\ControlSet001\Services\WinDefend`" /v LaunchProtected /t REG_DWORD /d 0 /f"
+    $pplScript = "$env:TEMP\strip_ppl.cmd"
+    Set-Content $pplScript -Encoding ASCII -Value @"
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f
+reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdNisSvc" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\ControlSet001\Services\WdNisSvc" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdFilter" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\ControlSet001\Services\WdFilter" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdBoot" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\ControlSet001\Services\WdBoot" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\WdNisDrv" /v Start /t REG_DWORD /d 4 /f
+reg add "HKLM\SYSTEM\ControlSet001\Services\WdNisDrv" /v Start /t REG_DWORD /d 4 /f
+"@
 
-# Disable the service start type (so it doesn't auto-start on boot)
-Write-Log "  Setting WinDefend Start=4 (Disabled) in both ControlSets..." 'STEP'
-$startDirect  = reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f 2>&1
-$startCs1     = reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f 2>&1
-Write-Log "  CurrentControlSet Start result : $startDirect" 'DATA'
-Write-Log "  ControlSet001     Start result : $startCs1" 'DATA'
-Run-Trusted -command "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend`" /v Start /t REG_DWORD /d 4 /f"
-Run-Trusted -command "reg add `"HKLM\SYSTEM\ControlSet001\Services\WinDefend`" /v Start /t REG_DWORD /d 4 /f"
+    Write-Log "  Executing strip_ppl.cmd via NSudoLG -U:T -P:E -Wait..." 'STEP'
+    $nsudoProc = Start-Process -FilePath $nSudo -ArgumentList "-U:T -P:E -Wait `"$pplScript`"" -Wait -PassThru -ErrorAction SilentlyContinue
+    Write-Log "  NSudoLG exit code: $($nsudoProc.ExitCode)" 'DATA'
+    Remove-Item $pplScript -Force -ErrorAction SilentlyContinue
 
-# Also disable WdNisSvc, WdFilter, WdBoot while we're at it
-foreach ($svc in @('WdNisSvc','WdFilter','WdBoot','WdNisDrv','MsSecCore','MsSecFlt','MsSecWfp')) {
-    $r = reg add "HKLM\SYSTEM\CurrentControlSet\Services\$svc" /v Start /t REG_DWORD /d 4 /f 2>&1
-    Write-Log "  Disable $svc : $r" 'DATA'
-    reg add "HKLM\SYSTEM\ControlSet001\Services\$svc" /v Start /t REG_DWORD /d 4 /f 2>&1 | Out-Null
+} else {
+    Write-Log "  NSudoLG.exe NOT found at $nSudo — cannot use NSudo method." 'WARN'
+    Write-Log "  Trying direct reg write (will fail at runtime but recorded for diagnosis)..." 'INFO'
+    $r1 = reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f 2>&1
+    $r2 = reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f 2>&1
+    Write-Log "  Direct LaunchProtected result: $r1" 'DATA'
+    Write-Log "  Direct Start result          : $r2" 'DATA'
 }
 
-# Verify what actually got written
+# Verify
 $ppCurrent = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
 $stCurrent = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name Start -ea 0).Start
 $ppCs1     = (Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
@@ -1267,30 +1276,25 @@ $stCs1     = (Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Services\WinDefend' -
 Write-Log "  VERIFY CurrentControlSet: LaunchProtected=$ppCurrent  Start=$stCurrent  (want: 0, 4)" 'DATA'
 Write-Log "  VERIFY ControlSet001    : LaunchProtected=$ppCs1      Start=$stCs1      (want: 0, 4)" 'DATA'
 
-if ($ppCurrent -eq 0 -and $stCurrent -eq 4) {
-    Write-Log "  LaunchProtected + Start written to CurrentControlSet. REBOOT REQUIRED to take effect." 'SUCCESS'
-} elseif ($ppCs1 -eq 0 -and $stCs1 -eq 4) {
-    Write-Log "  Written to ControlSet001 only. REBOOT REQUIRED." 'SUCCESS'
+if (($ppCurrent -eq 0 -or $ppCs1 -eq 0) -and ($stCurrent -eq 4 -or $stCs1 -eq 4)) {
+    Write-Log "  PPL stripped + Start=Disabled. REBOOT to complete — MsMpEng will NOT start next boot." 'SUCCESS'
 } else {
-    Write-Log "  WARNING: PPL registry writes may have been blocked (kernel protection active at runtime)." 'WARN'
-    Write-Log "  This is expected — the keys will be writable offline or during early boot." 'WARN'
-    Write-Log "  The policy reg files (disable1-11.reg) and scheduled task disables ARE effective." 'INFO'
+    Write-Log "  PPL write still blocked. Defender policy keys (disable1-11.reg) ARE applied — real-time protection is off." 'WARN'
+    Write-Log "  For full MsMpEng removal: reboot into WinRE or use offline registry editing." 'INFO'
 }
 
-# Still try MpCmdRun -DisableService as a best-effort
-Write-Log "  Attempting MpCmdRun -DisableService (best effort, likely blocked by PPL)..." 'STEP'
+# MpCmdRun -DisableService best-effort
 $mpPath = "$env:ProgramFiles\Windows Defender"
 if (Test-Path "$mpPath\MpCmdRun.exe") {
+    Write-Log "  Attempting MpCmdRun -DisableService..." 'STEP'
     $proc = Start-Process -FilePath "$mpPath\MpCmdRun.exe" -ArgumentList "-DisableService -HighPriority" -Wait -PassThru -ErrorAction SilentlyContinue
     Write-Log "  MpCmdRun exit code: $($proc.ExitCode)" 'DATA'
-} else {
-    Write-Log "  MpCmdRun.exe not found at $mpPath" 'WARN'
 }
 
-Write-Log "  *** A REBOOT IS REQUIRED for WinDefend to be fully disabled. ***" 'WARN'
-Write-Log "  After reboot: MsMpEng will not start, LaunchProtected=0, Start=Disabled." 'INFO'
+Write-Log "  *** REBOOT REQUIRED to complete WinDefend disable. ***" 'WARN'
 
 End-Stage "PPL strip + WinDefend disable (reboot required)"
+
 
 Start-Stage "Disable Windows Defender scheduled tasks"
 $allTasks      = Get-ScheduledTask -ErrorAction SilentlyContinue
