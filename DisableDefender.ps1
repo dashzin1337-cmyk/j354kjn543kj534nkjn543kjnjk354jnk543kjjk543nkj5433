@@ -1233,8 +1233,8 @@ Start-Stage "Strip PPL + delete WinDefend service key via PowerRun (SYSTEM token
 
 # Locate PowerRun.exe — it's bundled in the repo
 $powerRunPaths = @(
+    "C:\Windows\mnl\rsc\su\PowerRun.exe",
     "$PSScriptRoot\windows-defender-remover-release13\PowerRun.exe",
-    "C:\Windows\mnl\rsc\su\NSudoLG.exe",
     "windows-defender-remover-release13\PowerRun.exe"
 )
 $powerRun = $null
