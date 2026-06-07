@@ -1233,9 +1233,7 @@ Start-Stage "Strip PPL + delete WinDefend service key via PowerRun (SYSTEM token
 
 # Locate PowerRun.exe — it's bundled in the repo
 $powerRunPaths = @(
-    "C:\Windows\mnl\rsc\su\PowerRun.exe",
-    "$PSScriptRoot\windows-defender-remover-release13\PowerRun.exe",
-    "windows-defender-remover-release13\PowerRun.exe"
+    "C:\Windows\mnl\rsc\su\PowerRun.exe"
 )
 $powerRun = $null
 foreach ($p in $powerRunPaths) {
@@ -1261,50 +1259,36 @@ Write-Log "  PowerRun.exe found: $(Test-Path $powerRun)" 'DATA'
 if ($powerRun -and (Test-Path $powerRun)) {
     Write-Log "  PowerRun.exe found — using SYSTEM token to delete WinDefend service key." 'SUCCESS'
 
-    # Write a reg file that deletes the entire WinDefend service key (and related Wd* services)
+    # Write reg file that deletes WinDefend service keys entirely
     $delSvcReg = "$env:TEMP\delete_windefend.reg"
-    Set-Content $delSvcReg -Encoding Unicode -Value @"
-Windows Registry Editor Version 5.00
-
-[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WinDefend]
-[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdNisSvc]
-[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdNisDrv]
-[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdFilter]
-[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdBoot]
-[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WinDefend]
-[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdNisSvc]
-[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdNisDrv]
-[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdFilter]
-[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdBoot]
-
-"@
+    $regContent = "Windows Registry Editor Version 5.00`r`n`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WinDefend]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdNisSvc]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdNisDrv]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdFilter]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WdBoot]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WinDefend]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdNisSvc]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdNisDrv]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdFilter]`r`n" +
+                  "[-HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WdBoot]`r`n"
+    [System.IO.File]::WriteAllText($delSvcReg, $regContent, [System.Text.Encoding]::Unicode)
+    Write-Log "  Reg file written: $delSvcReg ($((Get-Item $delSvcReg).Length) bytes)" 'DATA'
 
     Write-Log "  Running: PowerRun regedit /s delete_windefend.reg..." 'STEP'
     $pr1 = Start-Process -FilePath $powerRun -ArgumentList "regedit.exe /s `"$delSvcReg`"" -Wait -PassThru -ErrorAction SilentlyContinue
     Write-Log "  PowerRun exit code: $($pr1.ExitCode)" 'DATA'
+    Start-Sleep -Seconds 1
+    Remove-Item $delSvcReg -Force -ErrorAction SilentlyContinue
 
     # Verify
     $wdKeyGone = -not (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend')
     Write-Log "  WinDefend service key deleted: $wdKeyGone" 'DATA'
 
-    # Also import all the policy regs from the defender remover repo via PowerRun
-    $defRemoverDir = Split-Path $powerRun -Parent
-    $policyRegs = Get-ChildItem "$defRemoverDir\Remove_Defender\*.reg" -ErrorAction SilentlyContinue
-    Write-Log "  Found $($policyRegs.Count) policy reg files in Remove_Defender\..." 'DATA'
-    foreach ($reg in $policyRegs) {
-        Write-Log "  PowerRun regedit /s $($reg.Name)..." 'STEP'
-        $pr = Start-Process -FilePath $powerRun -ArgumentList "regedit.exe /s `"$($reg.FullName)`"" -Wait -PassThru -ErrorAction SilentlyContinue
-        Write-Log "  Exit: $($pr.ExitCode)" 'DATA'
-        # Also run without PowerRun for keys that don't need SYSTEM
-        Start-Process regedit.exe -ArgumentList "/s `"$($reg.FullName)`"" -Wait -ErrorAction SilentlyContinue
-    }
-
-    Remove-Item $delSvcReg -Force -ErrorAction SilentlyContinue
-
     if ($wdKeyGone) {
         Write-Log "  WinDefend service key DELETED. After reboot MsMpEng will NOT start." 'SUCCESS'
     } else {
-        Write-Log "  WinDefend key still present — kernel may have re-created it. Reboot still needed." 'WARN'
+        Write-Log "  WinDefend key still present in memory — reboot to confirm deletion." 'WARN'
     }
 
 } else {
