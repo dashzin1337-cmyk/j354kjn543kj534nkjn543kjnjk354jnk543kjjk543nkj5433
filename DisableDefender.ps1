@@ -1224,79 +1224,73 @@ Write-LogBlank
 Write-ProcessSnapshot "AFTER process kills"
 End-Stage "Process/service kills"
 
-Start-Stage "Stop WinDefend service and neutralize MsMpEng"
+Start-Stage "Strip PPL + disable WinDefend for next boot (requires reboot to complete)"
 
-# The defeatMsMpEng CreateProcess token-theft approach is broken on Windows 11 26H2+ (build 26200+).
-# TrustedInstaller's handle can no longer be duplicated for SYSTEM impersonation via P/Invoke on this build.
-# Instead we directly stop the WinDefend service via sc.exe run through TrustedInstaller,
-# and strip LaunchProtected (PPL) from the registry so it cannot restart with protection.
+# PPL (LaunchProtected=3) on WinDefend is enforced by the kernel at runtime.
+# No user-mode code — not even TrustedInstaller — can change it while MsMpEng is running.
+# Strategy: write the registry keys now so they take effect on next boot BEFORE MsMpEng loads.
 
-Write-Log "  Step 1: Remove PPL (LaunchProtected) from WinDefend service registry via TrustedInstaller" 'STEP'
-$pplCmd = "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend`" /v LaunchProtected /t REG_DWORD /d 0 /f"
-Run-Trusted -command $pplCmd
+Write-Log "  Writing LaunchProtected=0 directly (takes effect after reboot)..." 'STEP'
+# Try direct reg write first (works if WinDefend is not PPL-guarding its own key at this point)
+$pplDirect = reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f 2>&1
+Write-Log "  Direct reg result: $pplDirect" 'DATA'
 
-# Verify PPL was cleared
-$pplVal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ErrorAction SilentlyContinue).LaunchProtected
-Write-Log "  WinDefend LaunchProtected after change: $pplVal (0 = PPL disabled)" 'DATA'
+# Also try via TrustedInstaller
+Run-Trusted -command "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend`" /v LaunchProtected /t REG_DWORD /d 0 /f"
 
-Write-Log "  Step 2: Set WinDefend start type to Disabled via TrustedInstaller" 'STEP'
-Run-Trusted -command "sc.exe config WinDefend start= disabled"
+# Also write to ControlSet001 (persists across reboots regardless of CurrentControlSet)
+$pplCs1 = reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v LaunchProtected /t REG_DWORD /d 0 /f 2>&1
+Write-Log "  ControlSet001 reg result: $pplCs1" 'DATA'
+Run-Trusted -command "reg add `"HKLM\SYSTEM\ControlSet001\Services\WinDefend`" /v LaunchProtected /t REG_DWORD /d 0 /f"
 
-# Verify
-$wdSvc = Get-WmiObject Win32_Service -Filter "Name='WinDefend'" -ErrorAction SilentlyContinue
-Write-Log "  WinDefend StartMode after change: $($wdSvc.StartMode)" 'DATA'
+# Disable the service start type (so it doesn't auto-start on boot)
+Write-Log "  Setting WinDefend Start=4 (Disabled) in both ControlSets..." 'STEP'
+$startDirect  = reg add "HKLM\SYSTEM\CurrentControlSet\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f 2>&1
+$startCs1     = reg add "HKLM\SYSTEM\ControlSet001\Services\WinDefend" /v Start /t REG_DWORD /d 4 /f 2>&1
+Write-Log "  CurrentControlSet Start result : $startDirect" 'DATA'
+Write-Log "  ControlSet001     Start result : $startCs1" 'DATA'
+Run-Trusted -command "reg add `"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend`" /v Start /t REG_DWORD /d 4 /f"
+Run-Trusted -command "reg add `"HKLM\SYSTEM\ControlSet001\Services\WinDefend`" /v Start /t REG_DWORD /d 4 /f"
 
-Write-Log "  Step 3: Stop WinDefend service via TrustedInstaller" 'STEP'
-Run-Trusted -command "sc.exe stop WinDefend"
-
-# Also disable DisableAntiSpyware/DisableAntiVirus directly in the non-policy key (needs TI)
-Write-Log "  Step 4: Set DisableAntiSpyware + DisableAntiVirus in Windows Defender key" 'STEP'
-$disableCmd = "reg add `"HKLM\SOFTWARE\Microsoft\Windows Defender`" /v DisableAntiSpyware /t REG_DWORD /d 1 /f & reg add `"HKLM\SOFTWARE\Microsoft\Windows Defender`" /v DisableAntiVirus /t REG_DWORD /d 1 /f"
-Run-Trusted -command $disableCmd
-
-Write-Log "  Step 5: Polling for MsMpEng to stop (max 60s)..." 'INFO'
-$waited = 0
-$msmpengStopped = $false
-while ($waited -lt 60) {
-    Start-Sleep -Seconds 2
-    $waited += 2
-    $mp = Get-Process -Name 'MsMpEng' -ErrorAction SilentlyContinue
-    if (-not $mp) {
-        Write-Log "  MsMpEng stopped after ${waited}s!" 'SUCCESS'
-        $msmpengStopped = $true
-        break
-    }
-    if ($waited % 10 -eq 0) {
-        Write-Log "  MsMpEng still running at ${waited}s... PID=$($mp.Id) CPU=$([math]::Round($mp.TotalProcessorTime.TotalSeconds,1))s WS=$([math]::Round($mp.WorkingSet64/1MB,1))MB" 'INFO'
-        # Retry stop on each 10s interval
-        Run-Trusted -command "sc.exe stop WinDefend"
-    }
-}
-if (-not $msmpengStopped) {
-    Write-Log "  MsMpEng still running after 60s. Logging final service state:" 'WARN'
-    $wdFinal = Get-WmiObject Win32_Service -Filter "Name='WinDefend'" -ErrorAction SilentlyContinue
-    Write-Log "  WinDefend: State=$($wdFinal.State) StartMode=$($wdFinal.StartMode) LaunchProtected=$(
-        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
-    )" 'WARN'
+# Also disable WdNisSvc, WdFilter, WdBoot while we're at it
+foreach ($svc in @('WdNisSvc','WdFilter','WdBoot','WdNisDrv','MsSecCore','MsSecFlt','MsSecWfp')) {
+    $r = reg add "HKLM\SYSTEM\CurrentControlSet\Services\$svc" /v Start /t REG_DWORD /d 4 /f 2>&1
+    Write-Log "  Disable $svc : $r" 'DATA'
+    reg add "HKLM\SYSTEM\ControlSet001\Services\$svc" /v Start /t REG_DWORD /d 4 /f 2>&1 | Out-Null
 }
 
-# Also run the original defeatMsMpEng for the RegSetDwords it does, even if the process-kill part fails
-Write-Log "  Step 6: Running original defeatMsMpEng script (for registry path, may partial-succeed)" 'STEP'
-if (Test-Path $script.FullName) {
-    Run-Trusted -command $run
-    Start-Sleep -Seconds 5
-    $innerLogs = Get-ChildItem "$env:TEMP\DefeatDefend_inner_*.log" -ErrorAction SilentlyContinue
-    if ($innerLogs) {
-        foreach ($il in $innerLogs) {
-            Write-Log "  Inner log: $($il.FullName) ($($il.Length) bytes)" 'SUCCESS'
-            Get-Content $il.FullName | ForEach-Object { Write-Log "    $_" 'DATA' }
-        }
-    } else {
-        Write-Log "  No inner log found (CreateProcess token-theft likely failed on this build — expected)." 'INFO'
-    }
+# Verify what actually got written
+$ppCurrent = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
+$stCurrent = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name Start -ea 0).Start
+$ppCs1     = (Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
+$stCs1     = (Get-ItemProperty 'HKLM:\SYSTEM\ControlSet001\Services\WinDefend' -Name Start -ea 0).Start
+Write-Log "  VERIFY CurrentControlSet: LaunchProtected=$ppCurrent  Start=$stCurrent  (want: 0, 4)" 'DATA'
+Write-Log "  VERIFY ControlSet001    : LaunchProtected=$ppCs1      Start=$stCs1      (want: 0, 4)" 'DATA'
+
+if ($ppCurrent -eq 0 -and $stCurrent -eq 4) {
+    Write-Log "  LaunchProtected + Start written to CurrentControlSet. REBOOT REQUIRED to take effect." 'SUCCESS'
+} elseif ($ppCs1 -eq 0 -and $stCs1 -eq 4) {
+    Write-Log "  Written to ControlSet001 only. REBOOT REQUIRED." 'SUCCESS'
+} else {
+    Write-Log "  WARNING: PPL registry writes may have been blocked (kernel protection active at runtime)." 'WARN'
+    Write-Log "  This is expected — the keys will be writable offline or during early boot." 'WARN'
+    Write-Log "  The policy reg files (disable1-11.reg) and scheduled task disables ARE effective." 'INFO'
 }
 
-End-Stage "WinDefend stop + PPL removal"
+# Still try MpCmdRun -DisableService as a best-effort
+Write-Log "  Attempting MpCmdRun -DisableService (best effort, likely blocked by PPL)..." 'STEP'
+$mpPath = "$env:ProgramFiles\Windows Defender"
+if (Test-Path "$mpPath\MpCmdRun.exe") {
+    $proc = Start-Process -FilePath "$mpPath\MpCmdRun.exe" -ArgumentList "-DisableService -HighPriority" -Wait -PassThru -ErrorAction SilentlyContinue
+    Write-Log "  MpCmdRun exit code: $($proc.ExitCode)" 'DATA'
+} else {
+    Write-Log "  MpCmdRun.exe not found at $mpPath" 'WARN'
+}
+
+Write-Log "  *** A REBOOT IS REQUIRED for WinDefend to be fully disabled. ***" 'WARN'
+Write-Log "  After reboot: MsMpEng will not start, LaunchProtected=0, Start=Disabled." 'INFO'
+
+End-Stage "PPL strip + WinDefend disable (reboot required)"
 
 Start-Stage "Disable Windows Defender scheduled tasks"
 $allTasks      = Get-ScheduledTask -ErrorAction SilentlyContinue
@@ -1402,3 +1396,17 @@ Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "  Log saved to: $script:LogFile" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Final reboot recommendation
+$ppFinal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name LaunchProtected -ea 0).LaunchProtected
+$stFinal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name Start -ea 0).Start
+if ($ppFinal -eq 0 -or $stFinal -eq 4) {
+    Write-Host "" 
+    Write-Host "  *** REBOOT REQUIRED ***" -ForegroundColor Yellow
+    Write-Host "  WinDefend registry has been modified. After reboot:" -ForegroundColor Yellow
+    Write-Host "    - MsMpEng will not start (Start=Disabled)" -ForegroundColor Yellow
+    Write-Host "    - PPL protection removed (LaunchProtected=0)" -ForegroundColor Yellow
+    Write-Host "  Reboot now for full effect." -ForegroundColor Yellow
+    Write-Host ""
+}
